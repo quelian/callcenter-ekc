@@ -21,7 +21,11 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Callable
 
-from operator_staff import canonicalize_operator_name, operators_prompt_sentence
+from operator_staff import (
+    canonicalize_operator_name,
+    operator_in_leniency_focus,
+    operators_prompt_sentence,
+)
 
 _BASE_URL = "https://llm.api.cloud.yandex.net/v1"
 _DEFAULT_MODEL = "yandexgpt-lite"
@@ -242,8 +246,27 @@ engagement_score — Вовлечённость, эмоциональность 
     "Персонализированное прощание: да"
   ],
   "positives": ["Оператор активно управлял разговором: \\"Правильно ли я понял, что вас интересует...\\""],
-  "negatives": ["Запрещённая фраза: \\"Я не знаю\\" — следует говорить \\"На текущий момент мне необходимо уточнить информацию\\""]
+  "negatives": ["Запрещённая фраза: \\"Я не знау\\" — следует говорить \\"На текущий момент мне необходимо уточнить информацию\\""]
 }}"""
+
+
+def _leniency_extra_system_for_forced(forced_operator_name: str | None) -> str:
+    """
+    Если в UI выбран оператор из зоны повышенного внимания — доп. инструкции к LLM
+    (пограничные случаи, акцент на positives). Постобработка +1 — в evaluation_leniency.
+    """
+    if not operator_in_leniency_focus(forced_operator_name):
+        return ""
+    return (
+        "\n\n---\nДОПОЛНЕНИЕ К ЭТОМУ ЗВОНКУ:\n"
+        "Оператор — из группы усиленной поддержки и развития (Егор, Артем или Даша).\n"
+        "Формальные критерии и чек-лист те же, без ослабления требований.\n"
+        "Если по тексту допустимы две близкие оценки — выбери более высокую.\n"
+        "positives: 3–4 содержательных пункта с короткими цитатами из реплик оператора.\n"
+        "negatives: только при явных нарушениях стандарта; по возможности 0–2 пункта, "
+        "формулировки уважительные; не дроби мелкие огрехи.\n"
+        "Не заполняй везде 10 баллов без оснований по шкалам критериев выше.\n---\n"
+    )
 
 
 def _operator_intro_snippet(role_text: str | None, max_lines: int = 8, max_chars: int = 600) -> str:
@@ -663,14 +686,21 @@ def _call_yandex_messages(
     return str(raw_content)
 
 
-def _call_yandex_api(flat_text: str | None, role_text: str | None, cfg: YandexCloudConfig) -> str:
+def _call_yandex_api(
+    flat_text: str | None,
+    role_text: str | None,
+    cfg: YandexCloudConfig,
+    *,
+    extra_system: str = "",
+) -> str:
     """Запрос для режима облачной оценки (использует eval-промпт).
 
     При невалидном JSON делает одну повторную попытку с просьбой исправить.
     """
+    system_prompt = _SYSTEM_PROMPT + (extra_system or "")
     user_content = _user_prompt(flat_text, role_text)
     content = _call_yandex_messages(
-        system_prompt=_SYSTEM_PROMPT,
+        system_prompt=system_prompt,
         user_content=user_content,
         cfg=cfg,
         max_tokens=2000,
@@ -683,7 +713,7 @@ def _call_yandex_api(flat_text: str | None, role_text: str | None, cfg: YandexCl
         return content
     except (json.JSONDecodeError, ValueError):
         retry_content = _call_yandex_messages(
-            system_prompt=_SYSTEM_PROMPT,
+            system_prompt=system_prompt,
             user_content=(
                 f"{user_content}\n\n"
                 "ВАЖНО: твой предыдущий ответ содержал невалидный JSON. "
@@ -857,7 +887,8 @@ def run_cloud_evaluation(
     _log(f"[cloud_eval] Облачная оценка: модель {model_uri}, таймаут={cfg.timeout_seconds:.0f}s...")
 
     try:
-        content = _call_yandex_api(flat_text, role_text, cfg)
+        extra_sys = _leniency_extra_system_for_forced(forced_operator_name)
+        content = _call_yandex_api(flat_text, role_text, cfg, extra_system=extra_sys)
         data = _extract_json(content)
         evaluation = _build_evaluation(data, forced_operator_name)
 
@@ -872,6 +903,10 @@ def run_cloud_evaluation(
 
         # Объективный пункт чек-листа по тексту (модель часто ошибается)
         apply_deterministic_name_mentions_merge(evaluation, flat_text, role_text, _log)
+
+        from evaluation_leniency import apply_focus_operator_adjustments
+
+        evaluation = apply_focus_operator_adjustments(evaluation, _log)
 
         _log("[cloud_eval] Облачная оценка завершена успешно.")
         return evaluation, "cloud_ok"

@@ -2221,7 +2221,7 @@ class CallQualityEvaluator:
         if not positives:
             positives.append("Сильные стороны слабо выражены в текущем транскрипте.")
 
-        return QualityEvaluation(
+        ev = QualityEvaluation(
             total_score=total_score,
             max_score=max_score,
             operator_name=operator_name,
@@ -2235,6 +2235,9 @@ class CallQualityEvaluator:
             positives=positives,
             negatives=negatives,
         )
+        from evaluation_leniency import apply_focus_operator_adjustments
+
+        return apply_focus_operator_adjustments(ev)
 
 
 def analyze_tone(audio_path: str | Path) -> str:

@@ -7,6 +7,10 @@ from __future__ import annotations
 
 import re
 
+# Операторы в зоне повышенного менторского внимания: те же критерии, но мягче трактовка пограничных
+# случаев в промпте LLM и постобработка (+1 к каждому критерию, см. evaluation_leniency.py).
+OPERATORS_LENIENCY_FOCUS: frozenset[str] = frozenset({"Егор", "Артем", "Даша"})
+
 # Канонические имена (как в интерфейсе и Google Sheets)
 OPERATOR_CANONICAL_NAMES: tuple[str, ...] = (
     "Егор",
@@ -94,6 +98,19 @@ _UNDEF_PHRASES = frozenset(
         "—",
     }
 )
+
+
+def operator_in_leniency_focus(name: str | None) -> bool:
+    """
+    True, если оператор — Егор, Артем или Даша (любой разрешённый алиас приводится к канону).
+    """
+    if name is None:
+        return False
+    s = str(name).strip()
+    if not s or s == "Не определено":
+        return False
+    c = canonicalize_operator_name(s)
+    return bool(c and c in OPERATORS_LENIENCY_FOCUS)
 
 
 def canonicalize_operator_name(raw: str | None) -> str | None:
