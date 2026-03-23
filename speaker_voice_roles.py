@@ -62,16 +62,11 @@ def _forced_bipartition_labels(embs):
 
 
 def _patch_torchaudio_compat() -> None:
-    """Monkeypatch torchaudio for SpeechBrain 1.x compatibility.
-
-    torchaudio 2.2+ removed ``list_audio_backends()``; SpeechBrain 1.0.x still
-    calls it unconditionally at import time.  Adding a stub prevents the
-    AttributeError that otherwise blocks the entire SpeechBrain import.
-    """
+    """Делегирует в общий модуль: непустой list_audio_backends (soundfile), иначе ложный варнинг SB."""
     try:
-        import torchaudio as _ta
-        if not hasattr(_ta, "list_audio_backends"):
-            _ta.list_audio_backends = lambda: []
+        from speechbrain_compat import apply_torchaudio_speechbrain_compat
+
+        apply_torchaudio_speechbrain_compat()
     except Exception:
         pass
 
@@ -100,30 +95,48 @@ def _load_ecapa_model():
     the model is already on disk and we never want to hang waiting for a remote
     version check.  `HF_HUB_OFFLINE` is restored after loading.
     Uses MPS (Apple Silicon GPU) if available for faster inference.
+
+    Lock: не пересекаемся с загрузкой faster-whisper (Ultima / HF), иначе тот поток
+    видит HF_HUB_OFFLINE=1 и падает с «outgoing traffic has been disabled».
     """
     global _ECAPA_MODEL_CACHE
     if _ECAPA_MODEL_CACHE is not None:
         return _ECAPA_MODEL_CACHE
 
     import os
-    _prev_offline = os.environ.get("HF_HUB_OFFLINE")
-    os.environ["HF_HUB_OFFLINE"] = "1"
-    try:
-        _patch_torchaudio_compat()
-        from speechbrain.inference.speaker import EncoderClassifier
 
-        device = _best_torch_device()
-        model = EncoderClassifier.from_hparams(
-            source=_ECAPA_SOURCE,
-            savedir=_ECAPA_SAVEDIR,
-            run_opts={"device": device},
-        )
-        _ECAPA_MODEL_CACHE = model
-    finally:
-        if _prev_offline is None:
-            os.environ.pop("HF_HUB_OFFLINE", None)
-        else:
-            os.environ["HF_HUB_OFFLINE"] = _prev_offline
+    from hf_hub_sync import (
+        HF_HUB_DOWNLOAD_LOCK,
+        recompute_huggingface_hub_offline_from_env,
+        set_huggingface_hub_offline_flag,
+        snapshot_huggingface_hub_offline_flag,
+    )
+
+    with HF_HUB_DOWNLOAD_LOCK:
+        _prev_offline = os.environ.get("HF_HUB_OFFLINE")
+        _prev_hf_const = snapshot_huggingface_hub_offline_flag()
+        os.environ["HF_HUB_OFFLINE"] = "1"
+        set_huggingface_hub_offline_flag(True)
+        try:
+            _patch_torchaudio_compat()
+            from speechbrain.inference.speaker import EncoderClassifier
+
+            device = _best_torch_device()
+            model = EncoderClassifier.from_hparams(
+                source=_ECAPA_SOURCE,
+                savedir=_ECAPA_SAVEDIR,
+                run_opts={"device": device},
+            )
+            _ECAPA_MODEL_CACHE = model
+        finally:
+            if _prev_offline is None:
+                os.environ.pop("HF_HUB_OFFLINE", None)
+            else:
+                os.environ["HF_HUB_OFFLINE"] = _prev_offline
+            if _prev_hf_const is not None:
+                set_huggingface_hub_offline_flag(_prev_hf_const)
+            else:
+                recompute_huggingface_hub_offline_from_env()
     return _ECAPA_MODEL_CACHE
 
 
@@ -267,9 +280,10 @@ def cluster_voice_segments(
     # 1. VAD-регионы по всему файлу (librosa.effects.split)
     # Смена спикера почти всегда совпадает с паузой, поэтому каждый
     # VAD-регион с высокой вероятностью принадлежит одному спикеру.
+    # top_db=28 (было 35) — не срезаем тихую речь: шёпот, «алло», начало фразы.
     # ------------------------------------------------------------------
     try:
-        raw_vad = librosa.effects.split(wav, top_db=35)
+        raw_vad = librosa.effects.split(wav, top_db=28)
     except Exception as exc:
         diagnostics["reason"] = f"vad_error: {exc}"
         return None, f"ошибка VAD: {exc}", diagnostics
@@ -278,7 +292,8 @@ def cluster_voice_segments(
     for vs_samp, ve_samp in raw_vad.tolist():
         ss = float(vs_samp) / sr
         ee = float(ve_samp) / sr
-        if ee - ss < 0.35:
+        # 0.25 с вместо 0.35 — ловим очень короткие реплики («да», «нет», «ага»).
+        if ee - ss < 0.25:
             continue
         # Склеить короткие паузы < 200ms — одна реплика часто содержит паузы внутри.
         if vad_regions and ss - vad_regions[-1][1] < 0.20:
@@ -294,17 +309,17 @@ def cluster_voice_segments(
     # 2. Нарезать VAD-регионы на окна для эмбеддингов.
     #    ECAPA-TDNN принимает сырую нормализованную волну (float32, 16kHz).
     #
-    #    Параметры подобраны для баланса скорость/качество:
-    #    - window_sec=2.0  — больший контекст = стабильнее d-vector у ECAPA
-    #    - hop_sec=2.0     — без перекрытия, уменьшает число окон вдвое
-    #    - MAX_WINDOWS=180 — жёсткий лимит; при превышении берём равномерную
-    #                        подвыборку чтобы не затянуть вычисления
+    #    Параметры подобраны для баланса точность/скорость:
+    #    - window_sec=2.0  — достаточный контекст для стабильного d-vector у ECAPA
+    #    - hop_sec=1.5     — 25% перекрытие (было 2.0 = без перекрытия; 1.0 = слишком много окон).
+    #                        Перекрывающиеся окна дают лучшее покрытие смен спикера.
+    #    - MAX_WINDOWS=240 — разумный лимит для длинных записей
     # ------------------------------------------------------------------
     window_sec = 2.0
-    hop_sec = 2.0
+    hop_sec = 1.5
     win_samp = int(window_sec * 16000)
     hop_samp = int(hop_sec * 16000)
-    MAX_WINDOWS = 180
+    MAX_WINDOWS = 240
 
     # Оцениваем порог энергии по всем регионам.
     energy_samples: list[float] = []
@@ -323,7 +338,7 @@ def cluster_voice_segments(
     for vs, ve in vad_regions:
         i0, i1 = int(vs * sr), min(int(ve * sr), len(wav))
         region = wav[i0:i1]
-        if region.size < int(0.35 * sr):
+        if region.size < int(0.25 * sr):
             continue
         # Normalize to [-1, 1] — ECAPA-TDNN expects float32 waveform.
         peak = float(np.max(np.abs(region)) + 1e-8)
@@ -433,7 +448,9 @@ def cluster_voice_segments(
     diagnostics["inter_cluster_distance"] = inter
     diagnostics["intra_cluster_distance"] = intra
     diagnostics["cluster_quality"] = quality
-    if quality < 1.05:
+    # Повышенный порог (1.3 вместо 1.05): если кластеры плохо разделены, лучше использовать
+    # time-aware forced split, который учитывает временну̀ю структуру диалога.
+    if quality < 1.3:
         labels = _forced_bipartition_labels(embs)
         forced_mode = True
         if labels is not None:
@@ -471,16 +488,17 @@ def cluster_voice_segments(
         seg_e = max(seg_s, float(seg_end))
         mid = (seg_s + seg_e) * 0.5
 
-        # Majority-vote по VAD-окнам с перекрытием ≥ 0.1с.
-        votes: dict[int, int] = {}
+        # Взвешенный vote: сумма длин перекрытий для каждого кластера.
+        # Это точнее чем счёт окон: длинное перекрытие = сильнее вес.
+        votes_w: dict[int, float] = {}
         for win_t, lab in zip(vad_window_times, labels):
             win_end = win_t + window_sec
             overlap = max(0.0, min(seg_e, win_end) - max(seg_s, win_t))
-            if overlap >= 0.1:
-                votes[int(lab)] = votes.get(int(lab), 0) + 1
+            if overlap >= 0.05:
+                votes_w[int(lab)] = votes_w.get(int(lab), 0.0) + overlap
 
-        if votes:
-            assigned = max(votes, key=lambda k: votes[k])
+        if votes_w:
+            assigned = max(votes_w, key=lambda k: votes_w[k])
         else:
             assigned = _nearest_time_label(mid)
 
@@ -488,16 +506,20 @@ def cluster_voice_segments(
 
     # ------------------------------------------------------------------
     # 6. Сглаживание одиночных перескоков A-B-A на коротких репликах.
+    # Два прохода: первый — очевидные одиночные флипы;
+    # второй — убирает «реликты» после первого прохода.
+    # Порог увеличен до 1.5 с (было 0.8 с) — убираем больше ошибочных смен.
     # ------------------------------------------------------------------
     smoothed = out[:]
     backup_two_cluster = out[:]
-    for i in range(1, len(smoothed) - 1):
-        prev_c = smoothed[i - 1][3]
-        cur_c = smoothed[i][3]
-        next_c = smoothed[i + 1][3]
-        cur_len = smoothed[i][1] - smoothed[i][0]
-        if prev_c == next_c and cur_c != prev_c and cur_len < 0.8:
-            smoothed[i] = (smoothed[i][0], smoothed[i][1], smoothed[i][2], prev_c)
+    for _pass in range(2):
+        for i in range(1, len(smoothed) - 1):
+            prev_c = smoothed[i - 1][3]
+            cur_c = smoothed[i][3]
+            next_c = smoothed[i + 1][3]
+            cur_len = smoothed[i][1] - smoothed[i][0]
+            if prev_c == next_c and cur_c != prev_c and cur_len < 1.5:
+                smoothed[i] = (smoothed[i][0], smoothed[i][1], smoothed[i][2], prev_c)
 
     if len({x[3] for x in smoothed}) < 2:
         if len({x[3] for x in backup_two_cluster}) >= 2:

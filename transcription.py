@@ -11,6 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeout
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 # Один поток: не копим фоновые punctuate после wall-timeout; следующая задача ждёт слот.
 _POST_EDIT_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="punct_pe")
@@ -25,6 +26,15 @@ def _shutdown_post_edit_executor() -> None:
 
 atexit.register(_shutdown_post_edit_executor)
 
+# Те же фильтры шумных варнингов, что в Streamlit (torch STFT, SpeechBrain и т.д.).
+try:
+    from speechbrain_compat import suppress_noisy_third_party_warnings
+
+    suppress_noisy_third_party_warnings()
+except Exception:
+    pass
+
+from hf_hub_sync import HF_HUB_DOWNLOAD_LOCK, force_huggingface_hub_online
 from operator_staff import OPERATOR_ALIASES
 
 
@@ -84,6 +94,29 @@ def parse_call_filename_wait_skip(filename: str) -> tuple[float, str] | None:
     return total, tail
 
 
+# ideal_ru (Максимум) и ultima_ru (Ultima): hotwords для смещения декодера на русскую лексику ЕКЦ и телефонного общения.
+_IDEAL_RU_RU_HOTWORDS = (
+    "ДВФУ Владивосток университет деканат институт факультет кафедра студент аспирант абитуриент "
+    "зачётная книжка расписание экзамен сессия общежитие оплата стипендия льготы документы справка "
+    "заявление договор приёмная комиссия зачисление перевод куратор военная кафедра "
+    "здравствуйте добрый день добрый вечер алло слушаю слышу вас чем помочь подскажите пожалуйста "
+    "уточню перезвоню спасибо благодарю за обращение заявитель оператор линия ожидание"
+)
+
+# «Ultima»: CTranslate2-сборка fine-tuned whisper-large-v3-russian (см. Hugging Face).
+# Переопределение: CALLQA_WHISPER_MODEL_ULTIMA=org/name
+DEFAULT_ULTIMA_WHISPER_REPO = "bzikst/faster-whisper-large-v3-russian"
+
+# Профили large: общий чувствительный VAD + hotwords. ideal_ru (Максимум) и ultima_ru (Ultima) —
+# один и тот же «мощный» decode (beam/best_of/patience + цепочка температур); отличается только модель Whisper.
+_PREMIUM_ASR_PROFILES = frozenset({"ideal_ru", "ultima_ru"})
+
+
+def resolve_ultima_whisper_model() -> str:
+    raw = os.environ.get("CALLQA_WHISPER_MODEL_ULTIMA", DEFAULT_ULTIMA_WHISPER_REPO).strip()
+    return raw or DEFAULT_ULTIMA_WHISPER_REPO
+
+
 _punct_deepmulti_compat_applied = False
 
 
@@ -117,6 +150,292 @@ def _apply_deepmultilingual_transformers_compat() -> None:
 
     pmp.PunctuationModel.__init__ = _patched_punctuation_init  # type: ignore[method-assign]
     _punct_deepmulti_compat_applied = True
+
+
+def _frame_rms_curve(y: "object", *, sample_rate: int, frame_ms: float = 40.0, hop_ms: float = 20.0) -> tuple[object, int, int]:
+    """RMS по коротким окнам для оценки уровня речи (не голой тишины)."""
+    import numpy as np
+
+    sig = np.asarray(y, dtype=np.float32).reshape(-1)
+    if sig.size == 0:
+        return np.array([], dtype=np.float64), 0, 0
+    wl = max(256, int(float(sample_rate) * frame_ms / 1000.0))
+    hop = max(64, int(float(sample_rate) * hop_ms / 1000.0))
+    n_fr = 1 + (sig.size - wl) // hop
+    if n_fr < 1:
+        r = float(np.sqrt(np.mean(sig * sig) + 1e-18))
+        return np.array([r], dtype=np.float64), wl, hop
+    out = np.empty(n_fr, dtype=np.float64)
+    for i in range(n_fr):
+        sl = sig[i * hop : i * hop + wl]
+        out[i] = float(np.sqrt(np.mean(sl * sl) + 1e-18))
+    return out, wl, hop
+
+
+def _estimate_active_speech_rms(fr_rms: "object") -> float:
+    """Уровень «активной» речи: медиана громких кадров относительно шумового подпора."""
+    import numpy as np
+
+    fr = np.asarray(fr_rms, dtype=np.float64)
+    if fr.size == 0:
+        return 1e-8
+    if fr.size < 4:
+        return float(np.median(fr) + 1e-12)
+    p15 = float(np.percentile(fr, 15))
+    p50 = float(np.percentile(fr, 50))
+    p85 = float(np.percentile(fr, 85))
+    # Порог: выше типичного «фона» в тишине линии, но не только самые всплески.
+    thresh = max(p15 * 3.0, p50 * 0.55, 1e-6)
+    loud = fr[fr >= thresh]
+    if loud.size >= max(3, fr.size // 8):
+        return float(np.median(loud) + 1e-12)
+    return float(np.median(fr) + 1e-12)
+
+
+def _apply_cosine_fades_edges(
+    y: "object",
+    *,
+    sample_rate: int,
+    fade_in_ms: float = 5.0,
+    fade_out_ms: float = 5.0,
+) -> object:
+    """Косинусные фейды по краям. fade_in_ms≤0 — не трогаем начало (важно после pre-roll: не глушить первый слог)."""
+    import numpy as np
+
+    sig = np.asarray(y, dtype=np.float32).reshape(-1)
+    if sig.size < 32:
+        return sig
+    out = sig.copy()
+    if fade_in_ms > 0:
+        n_in = int(float(sample_rate) * fade_in_ms / 1000.0)
+        n_in = max(8, min(n_in, sig.size // 8))
+        w_in = (0.5 - 0.5 * np.cos(np.linspace(0.0, np.pi, n_in, dtype=np.float32))).astype(np.float32)
+        out[:n_in] *= w_in
+    if fade_out_ms > 0:
+        n_out = int(float(sample_rate) * fade_out_ms / 1000.0)
+        n_out = max(8, min(n_out, sig.size // 8))
+        w_out = (0.5 - 0.5 * np.cos(np.linspace(0.0, np.pi, n_out, dtype=np.float32))).astype(np.float32)
+        out[-n_out:] *= w_out[::-1]
+    return out
+
+
+def _normalize_audio_for_asr(
+    y: object,
+    *,
+    sample_rate: int,
+    log: Callable[[str], None] | None = None,
+    target_active_rms: float = 0.11,
+    max_gain_linear: float = 45.0,
+    peak_limit: float = 0.989,
+    fade_in_ms: float = 5.0,
+    fade_out_ms: float = 5.0,
+) -> object:
+    """Нормализация **уже после обрезки ожидания**: DC, уровень по речевым кадрам, пик-лимит, фейды.
+
+    Тишина и ожидание в расчёте уровня почти не участвуют — не раздуваем шум до целевого RMS всего файла.
+    """
+    import numpy as np
+
+    arr = np.asarray(y, dtype=np.float32).reshape(-1)
+    if arr.size == 0:
+        return arr
+    # Постоянная составляющая после обрезки
+    arr = (arr - float(np.mean(arr))).astype(np.float32)
+    full_rms = float(np.sqrt(np.mean(np.square(arr)) + 1e-18))
+    fr_curve, _, _ = _frame_rms_curve(arr, sample_rate=sample_rate)
+    active_rms = _estimate_active_speech_rms(fr_curve)
+    gain = min(target_active_rms / active_rms, max_gain_linear)
+    out = (arr * float(gain)).astype(np.float32)
+    peak_b = float(np.max(np.abs(out)) + 1e-18)
+    if peak_b > peak_limit:
+        out = (out * (peak_limit / peak_b)).astype(np.float32)
+    peak_a = float(np.max(np.abs(out)) + 1e-18)
+    out = np.asarray(
+        _apply_cosine_fades_edges(
+            out, sample_rate=sample_rate, fade_in_ms=fade_in_ms, fade_out_ms=fade_out_ms
+        ),
+        dtype=np.float32,
+    )
+    if log is not None:
+        log(
+            f"Нормализация (хвост после ожидания): полный RMS {full_rms:.5f} → активный~{active_rms:.5f}, "
+            f"усиление ×{gain:.2f}, пик {peak_b:.3f}→{peak_a:.3f} (лимит {peak_limit:.3f})."
+        )
+    return out
+
+
+def _spectral_denoise_audio(
+    y: "np.ndarray",
+    sr: int,
+    *,
+    noise_percentile: float = 12.0,
+    over_subtraction: float = 2.2,
+    spectral_floor: float = 0.04,
+    log: "Callable[[str], None] | None" = None,
+) -> "np.ndarray":
+    """Спектральное шумоподавление (spectral subtraction + Wiener floor).
+
+    Алгоритм:
+    1. STFT → мощностный спектр.
+    2. Оценка шума: медиана спектра по кадрам с наименьшей энергией (нижний квантиль).
+    3. Вычитание шума с «полом» (spectral_floor) — речь не подавляется ниже floor×signal.
+    4. iSTFT → восстановленный сигнал.
+
+    Улучшает распознавание тихой/шумной речи: Whisper получает сигнал с лучшим SNR.
+    """
+    import numpy as np
+
+    try:
+        from scipy.signal import stft, istft
+    except Exception:
+        return y
+
+    arr = np.asarray(y, dtype=np.float32)
+    if arr.size < 1600:
+        return arr
+
+    nperseg = 512
+    noverlap = 384  # 75% перекрытие — точнее огибающая шума
+
+    try:
+        _, _, Zxx = stft(arr, fs=sr, nperseg=nperseg, noverlap=noverlap)
+        power = np.abs(Zxx) ** 2
+
+        frame_energies = np.mean(power, axis=0)
+        energy_threshold = np.percentile(frame_energies, noise_percentile)
+        noise_mask = frame_energies <= energy_threshold
+        if noise_mask.sum() < 3:
+            return arr
+        noise_psd = np.mean(power[:, noise_mask], axis=1, keepdims=True)
+
+        # Wiener-like gain: вычитаем шум с floor
+        clean_power = np.maximum(
+            power - over_subtraction * noise_psd,
+            spectral_floor * power,
+        )
+        gain = np.sqrt(clean_power / (power + 1e-12))
+        Zxx_clean = Zxx * gain
+
+        _, y_clean = istft(Zxx_clean, fs=sr, nperseg=nperseg, noverlap=noverlap)
+        y_clean = y_clean.astype(np.float32)
+
+        # Выравниваем длину (stft/istft могут добавить/убрать несколько сэмплов)
+        if len(y_clean) > len(arr):
+            y_clean = y_clean[: len(arr)]
+        elif len(y_clean) < len(arr):
+            y_clean = np.pad(y_clean, (0, len(arr) - len(y_clean)), mode="constant")
+
+        if log is not None:
+            before_snr = float(np.mean(power))
+            after_snr = float(np.mean(clean_power))
+            log(
+                f"Спектральный денойз: SNR до={before_snr:.4e}, после={after_snr:.4e} "
+                f"(подавление ×{over_subtraction}, floor={spectral_floor})"
+            )
+        return y_clean
+    except Exception as exc:
+        if log is not None:
+            log(f"Спектральный денойз пропущен ({exc}), используем исходный сигнал.")
+        return arr
+
+
+def _prepare_asr_normalized_wav(
+    source_path: str,
+    skip_seconds: float,
+    transcribe_kwargs: dict[str, object],
+    log: Callable[[str], None],
+    *,
+    target_active_rms: float = 0.11,
+    denoise: bool = False,
+) -> tuple[str, float, dict[str, object], str | None]:
+    """16 kHz mono WAV для Whisper: обрезка ожидания + опциональный **pre-roll** (см. docs/ASR_START_ANALYSIS.md).
+
+    При ``skip_seconds > 0`` грузим с ``offset = skip - pre_roll`` (хвост ожидания перед точкой разреза).
+    Таймкоды Whisper отсчитываются от начала WAV → ``time_offset = load_offset`` (не ``skip``).
+
+    ``clip_timestamps`` из kwargs удаляется.
+    """
+    import tempfile
+
+    try:
+        import librosa
+        import numpy as np
+        import soundfile as sf
+    except Exception as exc:
+        log(f"Подготовка ASR WAV пропущена (нет librosa/soundfile: {exc}).")
+        return source_path, 0.0, transcribe_kwargs, None
+
+    off = max(0.0, float(skip_seconds))
+    try:
+        pr_env = os.environ.get("CALLQA_ASR_PRE_ROLL_SECONDS", "0.25").strip() or "0.25"
+        pre_roll = max(0.0, min(float(pr_env), 2.0, off))
+    except ValueError:
+        pre_roll = min(0.25, off)
+    load_offset = max(0.0, off - pre_roll) if off > 0 else 0.0
+    try:
+        y, sr = librosa.load(
+            source_path, sr=16000, mono=True, offset=load_offset, duration=None
+        )
+    except Exception as exc:
+        log(f"Подготовка ASR: не удалось загрузить аудио ({exc}), исходный файл.")
+        return source_path, 0.0, transcribe_kwargs, None
+
+    y = np.asarray(y, dtype=np.float32)
+    if y.size == 0:
+        log(
+            "Подготовка ASR: после обрезки начала файл пуст (offset ≥ длины?) — исходный файл без обрезки."
+        )
+        return source_path, 0.0, transcribe_kwargs, None
+
+    if off > 0 and pre_roll > 0:
+        log(
+            f"ASR pre-roll: в WAV добавлено ~{pre_roll:.2f} с аудио *до* точки ожидания "
+            f"(загрузка с {load_offset:.2f} с, не с {off:.2f}) — стабильнее VAD/первое окно Whisper. "
+            f"time_offset={load_offset:.2f} с. Отключить: CALLQA_ASR_PRE_ROLL_SECONDS=0"
+        )
+
+    # Спектральный денойз (только когда запрошен, напр. Ultima): улучшает SNR для тихой/шумной речи.
+    if denoise:
+        y = _spectral_denoise_audio(y, int(sr), log=log)
+
+    after_trim_rms = float(np.sqrt(np.mean(np.square(y))) + 1e-12)
+    # После pre-roll начало — не жёсткий ноль: не глушим вход косинусом (иначе тихий «алло»).
+    fi = 0.0 if off > 0 else 5.0
+    y_n = np.asarray(
+        _normalize_audio_for_asr(
+            y, sample_rate=int(sr), log=log,
+            target_active_rms=target_active_rms,
+            fade_in_ms=fi, fade_out_ms=5.0,
+        ),
+        dtype=np.float32,
+    )
+    after_norm_rms = float(np.sqrt(np.mean(np.square(y_n))) + 1e-12)
+
+    fd, tmp = tempfile.mkstemp(suffix=".wav", prefix="callqa_asr_norm_")
+    os.close(fd)
+    try:
+        sf.write(tmp, y_n, int(sr))
+    except Exception as exc:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        log(f"Подготовка ASR: запись временного WAV не удалась ({exc}).")
+        return source_path, 0.0, transcribe_kwargs, None
+
+    kw = dict(transcribe_kwargs)
+    kw.pop("clip_timestamps", None)
+    if off > 0:
+        log(
+            f"Для ASR: ожидание по метке {off:.1f} с; фактическая загрузка с {load_offset:.2f} с, "
+            f"длина WAV {len(y_n) / float(sr):.1f} с (RMS до/после норм. ~{after_trim_rms:.4f} / ~{after_norm_rms:.4f})."
+        )
+    else:
+        log(
+            f"Аудио для ASR без обрезки ожидания: {len(y_n) / float(sr):.1f} с "
+            f"(RMS до/после норм. ~{after_trim_rms:.4f} / ~{after_norm_rms:.4f})."
+        )
+    return tmp, load_offset, kw, tmp
 
 
 class Transcriber:
@@ -171,8 +490,8 @@ class Transcriber:
         self._model = None
         self._asr_runtime_device = ""
         self._asr_runtime_compute = ""
-        # Large-v3 долго качается и грузится; «Максимум» + тяжёлая диаризация — дольше общий бюджет
-        if self.asr_profile == "ideal_ru":
+        # Large / HF-модели долго качаются; «Максимум» / «Ultima» + тяжёлая диаризация — дольше общий бюджет
+        if self.asr_profile in _PREMIUM_ASR_PROFILES:
             self.model_load_timeout_seconds = max(int(self.model_load_timeout_seconds), 1200)
             self.total_time_budget_seconds = max(int(self.total_time_budget_seconds), 1200)
 
@@ -208,7 +527,11 @@ class Transcriber:
         if cuda:
             for ctype in ("float16", "int8_float16", "float32", "int8"):
                 _add("cuda", ctype)
-        large = effective_model == "large-v3" or self.asr_profile == "ideal_ru"
+        large = (
+            self.asr_profile in _PREMIUM_ASR_PROFILES
+            or effective_model == "large-v3"
+            or "/" in effective_model
+        )
         if large:
             # int8_float32 — лучший баланс качества/скорости на CPU для large-v3
             for ctype in ("int8_float32", "float32", "default", "int8"):
@@ -228,18 +551,28 @@ class Transcriber:
     def _resolve_asr_model(self) -> str:
         if self.asr_profile == "ideal_ru":
             return "large-v3"
+        if self.asr_profile == "ultima_ru":
+            return resolve_ultima_whisper_model()
         if self.asr_profile == "medium_ru":
             return "medium"
         return "medium"
 
     def _asr_decode_preset(self) -> dict[str, object]:
+        if self.asr_profile == "ultima_ru":
+            # RU fine-tuned: beam=9/best_of=4 — баланс качество/скорость (beam 10/best_of 5 слишком тяжело).
+            return {"beam_size": 9, "best_of": 4, "patience": 1.1}
         if self.asr_profile == "ideal_ru":
-            # Выше medium: шире луч, выше patience; ниже порог «плохого» сегмента → чаще retry с temperature
-            return {"beam_size": 16, "best_of": 14, "patience": 1.55}
-        return {"beam_size": 8, "best_of": 6, "patience": 1.15}
+            # Systran large-v3: нейтральная модель, нужен широкий поиск.
+            return {"beam_size": 9, "best_of": 5, "patience": 1.12}
+        # medium_ru: лёгкий пресет для скорости.
+        return {"beam_size": 5, "best_of": 3, "patience": 0.9}
 
     def _log(self, message: str) -> None:
         print(f"[transcriber] {message}", flush=True)
+
+    def _stage(self, name: str, message: str) -> None:
+        """Помечает этап пайплайна распознавания в логах."""
+        self._log(f"[этап: {name}] {message}")
 
     @staticmethod
     def _split_sentences(text: str) -> list[str]:
@@ -421,6 +754,8 @@ class Transcriber:
             r"\bменя\s+зовут\b"
             r"|\bслушаю\s+вас\b"
             r"|\bспасибо\s+вам\s+за\s+обращение\b"
+            r"|\bблагодарим\s+вас\s+за\s+обращение\b"
+            r"|\bспасибо\s+за\s+(?:ваше\s+)?обращение\b"
             r"|\bчем\s+(?:я\s+могу|могу)\s+(?:вам\s+)?помочь\b"
             r"|\bвам\s+необходимо\b"
             r"|\bвы\s+можете\s+обратиться\b",
@@ -481,6 +816,8 @@ class Transcriber:
             r"\bподскажите,\s*пожалуйста,\s*как\s+вас\s+зовут\b",
             r"\bподскажите,\s*пожалуйста,\s*как\s+я\s+могу\s+к\s+вам\s+обращаться\b",
             r"\bспасибо\s+вам\s+за\s+обращение\b",
+            r"\bблагодарим\s+вас\s+за\s+обращение\b",
+            r"\bспасибо\s+за\s+(?:ваше\s+)?обращение\b",
             r"\bдвфу\b.*\bздравствуйте\b",
             r"\bздравствуйте\b.*\bдвфу\b",
             r"\bдобрый\s+день\b.*\bменя\s+зовут\b",
@@ -633,7 +970,13 @@ class Transcriber:
                         result[i + 1] = "Заявитель"
 
             # Closing phrase belongs to operator; prior short confirmation likely applicant.
-            if re.search(r"\bспасибо\s+вам\s+за\s+обращение\b", current.lower()):
+            # См. docs/CALL_CENTER_ROLE_ANCHORS.md — «за обращение» в официальной благодарности только у линии.
+            if re.search(
+                r"\bспасибо\s+вам\s+за\s+обращение\b"
+                r"|\bблагодарим\s+вас\s+за\s+обращение\b"
+                r"|\bспасибо\s+за\s+(?:ваше\s+)?обращение\b",
+                current.lower(),
+            ):
                 result[i] = "Оператор"
                 if i - 1 >= 0 and len(chunks[i - 1].split()) <= 8:
                     result[i - 1] = "Заявитель"
@@ -876,7 +1219,7 @@ class Transcriber:
     ) -> tuple[str, str, list[str], str, list[tuple[float, float, str]] | None]:
         if not self.enable_post_edit:
             return raw_text, "off", roles, "", None
-        if self.asr_profile not in {"ideal_ru", "medium_ru"}:
+        if self.asr_profile not in {"ideal_ru", "ultima_ru", "medium_ru"}:
             return raw_text, "off_profile", roles, "", None
         if not pieces:
             return raw_text, "off_no_pieces", roles, "", None
@@ -1166,15 +1509,19 @@ class Transcriber:
 
     def _ensure_model(self) -> None:
         if self._model is not None:
+            self._stage(
+                "ASR-модель",
+                f"уже в памяти ({self._resolve_asr_model()}, {self._asr_runtime_device}/{self._asr_runtime_compute})",
+            )
             return
         effective_model = self._resolve_asr_model()
-        self._log(
-            f"Загружаю ASR модель '{effective_model}' (profile={self.asr_profile}, "
-            f"запрошенный compute_type={self.compute_type})..."
+        self._stage(
+            "ASR-модель",
+            f"загрузка «{effective_model}» (profile={self.asr_profile}, compute_type={self.compute_type})…",
         )
         self._log(
-            "На первом запуске large-v3 может скачиваться 10–30+ минут. "
-            "Если сеть медленная, подождите или проверьте доступ к Hugging Face."
+            "На первом запуске крупная ASR-модель (large-v3 или репозиторий с Hugging Face) "
+            "может скачиваться 10–30+ минут. Если сеть медленная, подождите."
         )
         try:
             from faster_whisper import WhisperModel
@@ -1196,12 +1543,16 @@ class Transcriber:
             error_box: dict[str, Exception] = {}
 
             def _load_model(dev: str = device, ct: str = ctype) -> None:
+                # huggingface_hub: HF_HUB_OFFLINE в constants задаётся при импорте и не следует за env.
+                # Прогрев ECAPA мог оставить constants.HF_HUB_OFFLINE=True навсегда — без патча сеть «мёртвая».
                 try:
-                    model_box["model"] = WhisperModel(
-                        effective_model,
-                        device=dev,
-                        compute_type=ct,
-                    )
+                    with HF_HUB_DOWNLOAD_LOCK:
+                        with force_huggingface_hub_online():
+                            model_box["model"] = WhisperModel(
+                                effective_model,
+                                device=dev,
+                                compute_type=ct,
+                            )
                 except Exception as exc:  # pragma: no cover - safety net
                     error_box["error"] = exc
 
@@ -1216,7 +1567,7 @@ class Transcriber:
                 thread.join()
             if "model" in model_box:
                 self._model = model_box["model"]
-                self._log(f"Модель загружена: device={device}, compute_type={ctype}")
+                self._stage("ASR-модель", f"готова: device={device}, compute_type={ctype}")
                 self._asr_runtime_device = device
                 self._asr_runtime_compute = ctype
                 break
@@ -1233,10 +1584,16 @@ class Transcriber:
         else:
             hint = (
                 "Превышен таймаут или все варианты compute_type отвергнуты. "
-                "Проверьте интернет (скачивание large-v3), место на диске и версию ctranslate2. "
+                "Проверьте интернет (скачивание модели с Hugging Face), место на диске и версию ctranslate2. "
                 "Временно выберите «Стандарт» (medium / int8)."
             )
             if last_error is not None:
+                err_txt = str(last_error).lower()
+                if "hf_hub_offline" in err_txt or "outgoing traffic" in err_txt:
+                    hint += (
+                        " Если в сообщении про HF_HUB_OFFLINE: уберите из .env строку HF_HUB_OFFLINE=1 "
+                        "или задайте HF_HUB_OFFLINE=0 на время первой загрузки модели с Hugging Face."
+                    )
                 raise RuntimeError(f"{hint} Последняя ошибка: {last_error}") from last_error
             raise RuntimeError(hint)
 
@@ -1246,6 +1603,7 @@ class Transcriber:
         voice_items: list[tuple[float, float, str]],
         asr_elapsed: float,
     ) -> tuple[str, str, str, str, list[tuple[float, float, str]], list[str]]:
+        self._stage("роли", "черновик: спикеры по тексту (до уточнения голосом)")
         role_text = self._build_role_transcript(
             " ".join(x[2] for x in voice_items),
             chunks=[x[2] for x in voice_items],
@@ -1264,6 +1622,7 @@ class Transcriber:
             cluster_reason = "fallback text"
             cluster_diag: dict[str, object] = {}
             if self.heavy_diarization:
+                self._stage("роли/heavy", "тяжёлая диаризация по голосу…")
                 self._log("Joint mode: heavy diarization по голосу...")
                 try:
                     from speaker_diarization_heavy import run_heavy_diarization
@@ -1284,11 +1643,17 @@ class Transcriber:
                 except Exception as exc:
                     self._log(f"Heavy diarization ошибка ({exc}), перехожу на light.")
             if not clustered:
+                self._stage(
+                    "роли/ECAPA",
+                    f"кластеризация голоса (лёгкий режим), фрагментов от ASR={len(voice_items)}",
+                )
                 clustered, cluster_reason, cluster_diag = cluster_voice_segments(
                     audio_path=audio_path,
                     segments=voice_items,
                     target_speakers=2,
                 )
+            if not clustered:
+                self._stage("роли/ECAPA", "кластеры не получены — остаётся текстовая модель спикеров")
             if clustered:
                 by_cluster: dict[str, list[str]] = {}
                 for _s, _e, txt, cid in clustered:
@@ -1356,7 +1721,13 @@ class Transcriber:
                     f"quality={cluster_diag.get('cluster_quality', 0.0):.3f}; "
                     f"asr_seconds={asr_elapsed:.2f}; diarization_seconds={diarization_elapsed:.2f}"
                 )
+                self._stage(
+                    "роли",
+                    f"голос+текст за {diarization_elapsed:.2f} с: "
+                    f"{'heavy' if used_heavy else 'light'}, уверенность={role_confidence}",
+                )
         except Exception as exc:
+            self._stage("роли/ошибка", f"{exc!s} — текстовый fallback")
             role_diagnostics = f"role_mode=fallback; exception={exc}; asr_seconds={asr_elapsed:.2f}"
         return role_text, role_attribution, role_confidence, role_diagnostics, base_pieces, base_roles
 
@@ -1368,35 +1739,97 @@ class Transcriber:
     ) -> TranscriptionResult:
         self._ensure_model()
         path = str(audio_path)
+        self._stage("начало", f"файл «{Path(path).name}»")
         self._log(f"Начинаю обработку файла: {path}")
         info_language: str | None = None
+        # VAD: чувствительнее к тихому началу звонка; большой speech_pad — не отрезать первые слова до порога Silero.
+        _vad_base = {
+            "threshold": 0.26,
+            "neg_threshold": 0.11,
+            "min_speech_duration_ms": 120,
+            "min_silence_duration_ms": 2000,
+            "speech_pad_ms": 600,
+        }
+        # ideal_ru: чуть чувствительнее base (тихое «алло»), но без экстремальных порогов —
+        # иначе в поток попадает шум/музыка ожидания → large-v3 даёт больше мусора, чем medium.
+        _vad_ideal = {
+            "threshold": 0.17,
+            "neg_threshold": 0.085,
+            "min_speech_duration_ms": 100,
+            "min_silence_duration_ms": 2000,
+            "speech_pad_ms": 900,
+        }
+        # ultima_ru: максимальная чувствительность — ловим тихое «алло»/«здравствуйте» в самом начале.
+        # Очень низкий порог + большой pad гарантируют, что начало диалога не срезается Silero.
+        # speech_pad_ms=2000: расширяем речевые зоны на 2 с с каждой стороны — слова у границ не обрезаются.
+        _vad_ultima = {
+            "threshold": 0.12,
+            "neg_threshold": 0.06,
+            "min_speech_duration_ms": 80,
+            "min_silence_duration_ms": 2000,
+            "speech_pad_ms": 2000,
+        }
+        if self.asr_profile == "ultima_ru":
+            _vad_for_profile = _vad_ultima
+        elif self.asr_profile == "ideal_ru":
+            _vad_for_profile = _vad_ideal
+        else:
+            _vad_for_profile = _vad_base
         transcribe_kwargs = {
             "vad_filter": True,
-            # Tuned VAD: lower onset threshold + shorter min-speech so the first
-            # utterance is captured even when speech starts immediately after music.
-            "vad_parameters": {
-                "threshold": 0.35,           # onset (default 0.5) — catch quieter starts
-                "min_speech_duration_ms": 150,  # shorter min (default 250) — catch brief phrases
-                "speech_pad_ms": 400,        # keep default padding around each speech chunk
-            },
+            "vad_parameters": _vad_for_profile,
             "beam_size": 7,
             "best_of": 5,
+            # medium_ru: одна температура (быстрее). premium-профили ниже — цепочка fallback.
             "temperature": 0.0,
             "language": "ru",
             "task": "transcribe",
             "condition_on_previous_text": False,
-            "initial_prompt": "ДВФУ, деканат, зачётная книжка, расписание, приёмная комиссия, общежитие",
+            # Русский контекст ЕКЦ + разговорные клише линии (якорь для large-v3).
+            "initial_prompt": (
+                "Разговор на русском языке. ДВФУ, единый контактный центр Владивостока. "
+                "Приёмная комиссия, общежитие, зачётная книжка, расписание, справка, документы, студент, "
+                "стипендия, оплата, зачисление, перевод, куратор, военная кафедра. "
+                "Здравствуйте, добрый день, добрый вечер, алло, слушаю вас, слышу вас, чем могу помочь, "
+                "подскажите пожалуйста, уточню информацию, перезвоню, спасибо за обращение."
+            ),
         }
         transcribe_kwargs.update(self._asr_decode_preset())
+        if os.environ.get("CALLQA_ASR_NO_VAD", "").strip().lower() in ("1", "true", "yes"):
+            transcribe_kwargs["vad_filter"] = False
+            self._stage(
+                "ASR",
+                "VAD Silero отключён (CALLQA_ASR_NO_VAD=1) — медленнее, но начало разговора не режется VAD",
+            )
         if self.asr_profile == "ideal_ru":
-            # Меньше повторов/галлюцинаций, жёстче отсев «плохих» окон → чаще повтор с другой temperature
+            # 3-шаговая цепочка: Systran large-v3 без RU fine-tune — нужны резервные проходы, но не все 6.
             transcribe_kwargs.update(
                 {
-                    "compression_ratio_threshold": 2.15,
-                    "log_prob_threshold": -0.85,
-                    "no_speech_threshold": 0.58,
-                    "repetition_penalty": 1.07,
-                    "no_repeat_ngram_size": 3,
+                    "temperature": (0.0, 0.4, 0.8),
+                    "compression_ratio_threshold": 2.4,
+                    "log_prob_threshold": -1.0,
+                    "no_speech_threshold": 0.62,
+                }
+            )
+        elif self.asr_profile == "ultima_ru":
+            # 3-шаговая цепочка температур (4 шага слишком замедляют на длинных сегментах).
+            # no_speech_threshold=0.82 — Whisper пробует декодировать даже очень тихие сегменты.
+            # log_prob_threshold=-1.2 — допускаем более «неуверенные» сегменты (не пропускаем тихое начало).
+            # compression_ratio_threshold=2.5 — чуть мягче: не отбрасываем шумные, но реальные сегменты.
+            transcribe_kwargs.update(
+                {
+                    "temperature": (0.0, 0.3, 0.6),
+                    "compression_ratio_threshold": 2.5,
+                    "log_prob_threshold": -1.2,
+                    "no_speech_threshold": 0.82,
+                }
+            )
+        else:
+            # medium_ru: первое окно Whisper (до 30 с) при дефолтном no_speech может «прыгнуть» вперёд.
+            transcribe_kwargs.update(
+                {
+                    "no_speech_threshold": 0.56,
+                    "log_prob_threshold": -1.42,
                 }
             )
         # Enable word-level timestamps for sub-segment splitting at silence gaps.
@@ -1404,12 +1837,41 @@ class Transcriber:
         _wt_sig = inspect.signature(self._model.transcribe)
         _word_ts_enabled = "word_timestamps" in _wt_sig.parameters
         if _word_ts_enabled:
-            transcribe_kwargs["word_timestamps"] = True
-        self._log(
-            "ASR пресет: "
+            # ideal_ru и ultima_ru: вкл. по умолчанию — сегменты режутся по паузам → точнее дiaризация.
+            # medium_ru: выкл. (модель слабее, экономия важнее). Переопределение: CALLQA_ASR_WORD_TIMESTAMPS=0|1
+            _wts_default = "0" if self.asr_profile == "medium_ru" else "1"
+            _wts_env = os.environ.get("CALLQA_ASR_WORD_TIMESTAMPS", _wts_default).strip().lower()
+            if _wts_env in ("0", "false", "no", "off"):
+                transcribe_kwargs["word_timestamps"] = False
+            else:
+                transcribe_kwargs["word_timestamps"] = True
+
+        if self.asr_profile in _PREMIUM_ASR_PROFILES:
+            _tw_sig = inspect.signature(self._model.transcribe)
+            _twp = _tw_sig.parameters
+            if "hotwords" in _twp:
+                transcribe_kwargs["hotwords"] = _IDEAL_RU_RU_HOTWORDS
+            # Кавычки «» для слияния с токенами при word_timestamps.
+            if "prepend_punctuations" in _twp:
+                transcribe_kwargs["prepend_punctuations"] = "\"'\u201c\u00bf([{-\u00ab"
+            if "append_punctuations" in _twp:
+                transcribe_kwargs["append_punctuations"] = "\"'.。,，!！?？:：\u201d)]}、\u00bb"
+
+        _wts_log = (
+            "off (API не поддерживает)"
+            if not _word_ts_enabled
+            else (
+                "on"
+                if transcribe_kwargs.get("word_timestamps")
+                else "off (ускорение, CALLQA_ASR_WORD_TIMESTAMPS=0)"
+            )
+        )
+        self._stage(
+            "ASR-параметры",
             f"profile={self.asr_profile}, beam={transcribe_kwargs['beam_size']}, "
             f"best_of={transcribe_kwargs['best_of']}, patience={transcribe_kwargs.get('patience', 'n/a')}, "
-            f"word_timestamps={'on' if _word_ts_enabled else 'off (not supported)'}"
+            f"word_timestamps={_wts_log}"
+            + (", ru_hotwords=on" if transcribe_kwargs.get("hotwords") else ""),
         )
         clip_applied = False
         skip_sec = 0.0
@@ -1424,41 +1886,108 @@ class Transcriber:
             name_for_skip = Path(name_for_skip).name
             parsed = parse_call_filename_wait_skip(name_for_skip)
             if parsed is not None:
-                skip_sec, wait_token = parsed
-                mm = int(skip_sec // 60)
-                ss = int(skip_sec % 60)
-                self._log(
-                    f"Пропуск ожидания по имени файла: «{wait_token}» → {skip_sec:.0f} с "
-                    f"({mm:02d}:{ss:02d} от начала записи)"
+                tot_wait, wait_token = parsed
+                disable_fn = os.environ.get("CALLQA_DISABLE_FILENAME_SKIP", "").strip().lower() in (
+                    "1",
+                    "true",
+                    "yes",
                 )
-                file_skip_extra = (
-                    f"file_skip_source=filename; file_wait_token={wait_token}; "
-                    f"file_skip_seconds={skip_sec:.2f}"
-                )
+                if disable_fn:
+                    self._log(
+                        "[asr] Пропуск начала по хвосту имени отключён (CALLQA_DISABLE_FILENAME_SKIP)."
+                    )
+                    file_skip_extra = "file_skip_source=filename_disabled_by_env"
+                else:
+                    skip_sec = tot_wait
+                    mm = int(skip_sec // 60)
+                    ss = int(skip_sec % 60)
+                    self._log(
+                        f"Пропуск ожидания по имени файла: «{wait_token}» → {skip_sec:.0f} с "
+                        f"({mm:02d}:{ss:02d} от начала записи)"
+                    )
+                    file_skip_extra = (
+                        f"file_skip_source=filename; file_wait_token={wait_token}; "
+                        f"file_skip_seconds={skip_sec:.2f}"
+                    )
             else:
                 file_skip_extra = "file_skip_source=none"
 
         if skip_sec > 0:
+            self._stage("пропуск ожидания", f"{skip_sec:.1f} с от начала будут отрезаны до распознавания")
+        else:
+            self._stage("пропуск ожидания", "не задан (имя файла без _MM-SS и нет --skip-first-seconds)")
+
+        self._stage(
+            "аудио",
+            "подготовка временного WAV: обрезка начала (если есть) + нормализация громкости, 16 kHz mono",
+        )
+        # Пропуск ожидания: по возможности физическая обрезка во временном WAV (см. _prepare_asr_normalized_wav),
+        # а не clip_timestamps. clip — только запасной вариант, если WAV не создать.
+        # Ultima: агрессивнее нормализуем (+0.02 к целевому RMS) + спектральный денойз для SNR.
+        _norm_target = 0.13 if self.asr_profile == "ultima_ru" else 0.11
+        _do_denoise = self.asr_profile == "ultima_ru"
+        asr_path, time_offset, transcribe_kwargs, _asr_tmp = _prepare_asr_normalized_wav(
+            path, skip_sec, transcribe_kwargs, self._log,
+            target_active_rms=_norm_target,
+            denoise=_do_denoise,
+        )
+        if skip_sec > 0 and _asr_tmp is None and asr_path == path:
             signature = inspect.signature(self._model.transcribe)
             if "clip_timestamps" in signature.parameters:
                 transcribe_kwargs["clip_timestamps"] = f"{skip_sec}"
                 clip_applied = True
-                self._log(f"Clip timestamps: {skip_sec:.1f}s")
+                time_offset = 0.0
+                self._log(
+                    f"Запасной режим: начало {skip_sec:.1f} с только через clip_timestamps "
+                    f"(временный WAV с обрезкой не создан)."
+                )
             else:
-                self._log("Внимание: версия faster-whisper без clip_timestamps, начало не пропускаю.")
-        # faster-whisper reports segment timestamps absolute from the file start
-        # even when clip_timestamps is set, so no additional offset is needed.
-        time_offset = 0.0
+                self._log(
+                    "Внимание: пропуск начала недоступен — нет clip_timestamps и не удалось собрать WAV."
+                )
         asr_started = time.perf_counter()
-        self._log("Распознаю речь...")
-        segments, info = self._model.transcribe(path, **transcribe_kwargs)
-        asr_elapsed = time.perf_counter() - asr_started
-
+        self._stage(
+            "Whisper",
+            "запуск модели: чтение подготовленного WAV, VAD (Silero), признаки — на длинных файлах несколько минут",
+        )
+        try:
+            segments, info = self._model.transcribe(asr_path, **transcribe_kwargs)
+        finally:
+            if _asr_tmp:
+                try:
+                    os.unlink(_asr_tmp)
+                except OSError:
+                    pass
+        prep_elapsed = time.perf_counter() - asr_started
+        _dur_full = float(getattr(info, "duration", 0.0) or 0.0)
+        _dur_vad = float(getattr(info, "duration_after_vad", _dur_full) or _dur_full)
+        self._stage(
+            "Whisper",
+            f"признаки за {prep_elapsed:.1f} с (аудио {_dur_full:.1f} с, после VAD ~{_dur_vad:.1f} с речи); "
+            f"дальше в этом же этапе — потоковое декодирование и сбор текста (логи «ASR прогресс»); "
+            f"отсев IVR и галлюцинаций промпта — по мере поступления сегментов",
+        )
+        decode_started = time.perf_counter()
+        _last_progress_log = decode_started
         # Hallucination filter: discard segments whose words overlap >50% with initial_prompt.
         # Whisper sometimes repeats the prompt verbatim when audio is silent or clipped.
         _raw_prompt = str(transcribe_kwargs.get("initial_prompt") or "")
-        _stop_words = {"и", "в", "по", "на", "с", "к", "у", "из", "за", "не", "это", "что", "как"}
+        # Слова из initial_prompt, которые совпадают с нормальной речью оператора — не считаем для анти-галлюцинации
+        _stop_words = {
+            "и", "в", "по", "на", "с", "к", "у", "из", "за", "не", "это", "что", "как", "языке",
+            "двфу", "единый", "контактный", "центр", "владивостока", "здравствуйте", "добрый", "день",
+            "вечер", "алло", "слушаю", "вас", "слышу", "чем", "могу", "вам", "помочь", "подскажите",
+            "пожалуйста", "уточню", "информацию", "перезвоню", "спасибо", "обращение", "разговор",
+            "русском", "приёмная", "комиссия", "общежитие", "зачётная", "книжка", "расписание",
+            "справка", "документы", "студент", "стипендия", "оплата", "зачисление", "перевод",
+            "куратор", "военная", "кафедра", "университет", "деканат", "институт", "факультет",
+            # Частые слова из initial_prompt, иначе приветствие оператора ошибочно режется как «копия промпта».
+            "ваш", "ваше", "вашего", "оператор", "специалист", "линия", "звонок", "телефон",
+            "абитуриент", "заявитель",
+        }
         _prompt_words = set(re.sub(r"[^\w\s]", "", _raw_prompt.lower()).split()) - _stop_words
+        # Первые секунды после обрезки ожидания не фильтруем по пересечению с промптом (там реальное приветствие).
+        _hallucination_overlap_ignore_sec = 32.0
 
         # Phrases spoken by PBX auto-informer at the very end of a call.
         # These are never part of the human conversation and must be removed.
@@ -1478,7 +2007,17 @@ class Transcriber:
         ivr_tail_hit = False  # once IVR phrase seen, discard everything after
         for segment in segments:
             segment_count += 1
-            sub_segs = self._split_segment_at_silences(segment, min_silence_gap=0.35)
+            _now = time.perf_counter()
+            # Обратная связь: декодер отдаёт сегменты лениво — без логов кажется «зависание».
+            if segment_count == 1 or (_now - _last_progress_log) >= 6.0:
+                self._log(
+                    f"ASR прогресс: сегмент #{segment_count}, распознано примерно до {segment.end:.1f} с записи, "
+                    f"декодирование идёт {(_now - decode_started):.1f} с"
+                )
+                _last_progress_log = _now
+            # Ultima: меньший порог паузы → больше подсегментов → точнее диаризация.
+            _min_gap = 0.25 if self.asr_profile == "ultima_ru" else 0.35
+            sub_segs = self._split_segment_at_silences(segment, min_silence_gap=_min_gap)
             for seg_start, seg_end, piece in sub_segs:
                 if not piece:
                     continue
@@ -1488,7 +2027,10 @@ class Transcriber:
                     self._log(f"[asr] Отброшен хвост автоинформатора: «{piece[:80]}»")
                 if ivr_tail_hit:
                     continue
-                if len(_prompt_words) >= 3:
+                if (
+                    len(_prompt_words) >= 3
+                    and float(seg_start) >= _hallucination_overlap_ignore_sec
+                ):
                     seg_words = set(re.sub(r"[^\w\s]", "", piece.lower()).split())
                     overlap = len(seg_words & _prompt_words) / len(seg_words) if seg_words else 0.0
                     if overlap > 0.85 and len(seg_words) >= 5:
@@ -1498,21 +2040,27 @@ class Transcriber:
                 parts.append(piece)
                 chunks.extend(self._split_sentences(piece))
                 whisper_pieces_rel.append((seg_start, seg_end, piece))
-            if segment_count % 10 == 0:
-                self._log(
-                    f"Обработано сегментов: {segment_count}, текущий таймкод: {segment.end:.1f}с"
-                )
-        self._log(
-            f"Распознавание завершено. Сегментов: {segment_count}"
-            + (", хвост автоинформатора обрезан" if ivr_tail_hit else "")
-            + (f", отброшено галлюцинаций: {hallucination_count}" if hallucination_count else "")
-        )
+        decode_elapsed = time.perf_counter() - decode_started
+        asr_elapsed = time.perf_counter() - asr_started
         text = " ".join(parts).strip()
+        self._stage(
+            "текст",
+            f"распознавание завершено: сегментов Whisper={segment_count}, символов ≈{len(text)}, "
+            f"фрагментов с таймкодами={len(whisper_pieces_rel)}; "
+            f"декод {decode_elapsed:.1f} с, всего ASR {asr_elapsed:.1f} с"
+            + ("; IVR-хвост обрезан" if ivr_tail_hit else "")
+            + (f"; галлюцинаций отброшено: {hallucination_count}" if hallucination_count else ""),
+        )
         info_language = getattr(info, "language", None)
         whisper_pieces_rel = [(s + time_offset, e + time_offset, t) for s, e, t in whisper_pieces_rel]
 
         text = self._postprocess_ru_text(text)
+        self._stage("текст", "постобработка русского (нормализация текста) завершена")
         total_started = time.perf_counter()
+        self._stage(
+            "роли+голос",
+            f"совмещение ECAPA/кластеров с {len(whisper_pieces_rel)} фрагментами ASR (исходное аудио для голоса)",
+        )
         (
             role_text,
             role_attribution,
@@ -1525,6 +2073,11 @@ class Transcriber:
             voice_items=whisper_pieces_rel,
             asr_elapsed=asr_elapsed,
         )
+        joint_elapsed = time.perf_counter() - total_started
+        self._stage(
+            "роли+голос",
+            f"блок завершён за {joint_elapsed:.2f} с — {role_attribution}; уверенность={role_confidence}",
+        )
         text_work = text
         role_text_work = role_text
         llm_elapsed = 0.0
@@ -1533,9 +2086,15 @@ class Transcriber:
         nr: str | None = None
         llm_note = ""
         llm_cfg = self._resolve_llm_post_edit_config()
+        if not self.enable_llm_post_edit:
+            self._stage("LLM-постредактор", "выключен в настройках")
         if self.enable_llm_post_edit and self.llm_backend == "yandex" and self.llm_yandex_api_key and self.llm_yandex_folder_id:
             from llm_cloud_eval import YandexCloudConfig, run_yandex_post_edit_threaded
 
+            self._stage(
+                "LLM",
+                f"Yandex AI Studio, модель gpt://{self.llm_yandex_folder_id}/{self.llm_yandex_model}",
+            )
             ycfg = YandexCloudConfig(
                 api_key=self.llm_yandex_api_key,
                 folder_id=self.llm_yandex_folder_id,
@@ -1565,6 +2124,7 @@ class Transcriber:
         elif self.enable_llm_post_edit and self.llm_backend == "embedded":
             from llm_embedded_deepseek import run_embedded_llm_post_edit_threaded
 
+            self._stage("LLM", "встроенная DeepSeek / Hugging Face")
             self._log(
                 f"LLM пост-редактор (встроенная DeepSeek / Hugging Face), "
                 f"таймаут≤{self.llm_post_edit_timeout_seconds:.0f}s..."
@@ -1589,6 +2149,7 @@ class Transcriber:
         elif llm_cfg is not None:
             from llm_post_edit import run_llm_post_edit_threaded
 
+            self._stage("LLM", f"HTTP API {llm_cfg.base_url}, модель={llm_cfg.model}")
             self._log(
                 f"LLM пост-редактор (HTTP): {llm_cfg.base_url}, модель={llm_cfg.model}, "
                 f"таймаут≤{self.llm_post_edit_timeout_seconds:.0f}s..."
@@ -1611,9 +2172,15 @@ class Transcriber:
                 self._log(f"LLM пост-редактор не применён ({llm_diag}), {llm_elapsed:.2f}s")
         elif self.enable_llm_post_edit and self.llm_backend == "remote":
             llm_diag = "remote_missing_url_or_model"
+            self._stage("LLM", "remote: нет URL/модели — задайте LLM_POST_EDIT_* в .env")
             self._log(
                 "LLM remote: задайте LLM_POST_EDIT_BASE_URL и LLM_POST_EDIT_MODEL в .env "
                 "или передайте URL/модель в Transcriber."
+            )
+        elif self.enable_llm_post_edit:
+            self._stage(
+                "LLM-постредактор",
+                f"включён, но сценарий не сработал (backend={self.llm_backend!r}) — см. ключи Yandex/URL",
             )
 
         skip_local_post = nf is not None and nr is not None
@@ -1629,7 +2196,9 @@ class Transcriber:
         if skip_local_post:
             post_status = "skipped_after_llm"
             post_reason = llm_diag
+            self._stage("локальный пост", "пропуск — текст и роли уже обработаны LLM")
         elif self.enable_post_edit:
+            self._stage("локальный пост", "пунктуация и уточнение ролей (локальная модель)")
             self._log("Запускаю локальный пост-редактор текста/ролей...")
             post_text, post_status, refined_roles, post_reason, post_pieces = self._post_edit_ru_dialogue(
                 raw_text=text_work,
@@ -1646,7 +2215,9 @@ class Transcriber:
             )
         else:
             post_reason = "disabled"
+            self._stage("локальный пост", "выключен (enable_post_edit=false)")
 
+        self._stage("сборка отчёта", "финальная склейка расшифровки по ролям после пост-обработки")
         pieces_for_roles = post_pieces if post_pieces is not None else role_pieces
         if not skip_local_post and refined_roles and pieces_for_roles and len(refined_roles) == len(pieces_for_roles):
             new_role_text = self._roles_to_transcript([p[2] for p in pieces_for_roles], refined_roles)
@@ -1667,8 +2238,14 @@ class Transcriber:
 
         self._log("Текст собран.")
         self._log("Сформирована расшифровка по ролям.")
+        self._stage("тональность", "анализ тона по исходному аудио (librosa)")
         tone_summary = analyze_tone(audio_path)
+        self._stage("тональность", f"результат: {tone_summary}")
         self._log(f"Оценка тона: {tone_summary}")
+        self._stage(
+            "готово",
+            f"итог: язык={info_language or '—'}, символов текста={len(text)}, ASR={self._resolve_asr_model()}",
+        )
         return TranscriptionResult(
             text=text,
             language=info_language,
@@ -2357,8 +2934,8 @@ def main() -> None:
     parser.add_argument(
         "--asr-profile",
         default="medium_ru",
-        choices=["medium_ru", "ideal_ru"],
-        help="Профиль ASR-декодинга: medium_ru|ideal_ru",
+        choices=["medium_ru", "ideal_ru", "ultima_ru"],
+        help="Профиль ASR-декодинга: medium_ru|ideal_ru|ultima_ru (Ultima = whisper-large-v3-russian, HF)",
     )
     parser.add_argument(
         "--heavy-diarization",
@@ -2399,7 +2976,7 @@ def main() -> None:
     parser.add_argument(
         "--enable-post-edit",
         action="store_true",
-        help="Включить локальный пост-редактор пунктуации (medium_ru и ideal_ru)",
+        help="Включить локальный пост-редактор пунктуации (medium_ru, ideal_ru, ultima_ru)",
     )
     parser.add_argument(
         "--post-edit-timeout-seconds",

@@ -43,11 +43,12 @@
 Качество ролей сильно зависит от качества транскрибации.
 
 - `medium_ru` — средний режим (`medium`);
-- `ideal_ru` — максимальное качество (`large-v3`) с принудительным `language=ru`.
+- `ideal_ru` — максимальное качество (`large-v3`, Systran) с принудительным `language=ru`;
+- `ultima_ru` — **Ultima**: fine-tuned `whisper-large-v3-russian` с Hugging Face (см. `CALLQA_WHISPER_MODEL_ULTIMA`); **тот же premium decode**, что у `ideal_ru` (см. `transcription.py`).
 
-## Пост-редактор (medium_ru / ideal_ru)
+## Пост-редактор (medium_ru / ideal_ru / ultima_ru)
 
-Для `medium_ru` и `ideal_ru` доступен один и тот же локальный пост-редактор:
+Для `medium_ru`, `ideal_ru` и `ultima_ru` доступен один и тот же локальный пост-редактор:
 
 1. deterministic-нормализация текста;
 2. нейросетевая пунктуация (`deepmultilingualpunctuation`);
@@ -68,7 +69,7 @@
 
 Для максимального качества ролей:
 
-- профиль `ideal_ru`
-- включенный `Max Quality RU (heavy)`
+- профиль `ideal_ru` или `ultima_ru` (в Streamlit — **«Максимум»** / **«Ultima»**, heavy по умолчанию включён)
+- включенный `Max Quality RU (heavy)` там, где применимо
 - включенный `Пост-редактор (RU, local)`
 - таймаут heavy diarization 180-240 секунд

@@ -155,7 +155,7 @@ def run_embedded_llm_post_edit(
         with torch.inference_mode():
             out = model.generate(
                 **inputs,
-                max_new_tokens=2048,
+                max_new_tokens=4096,
                 do_sample=False,
                 pad_token_id=getattr(tok, "pad_token_id", None) or tok.eos_token_id,
             )

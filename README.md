@@ -6,12 +6,14 @@
 
 - **Windows (скачать с GitHub, cmd, запуск):** [docs/WINDOWS.md](docs/WINDOWS.md)  
 - **GitHub:** первый push и синхронизация — [docs/GITHUB_SETUP.md](docs/GITHUB_SETUP.md)
+- **Пропадает начало разговора после ожидания?** Разбор причин и переменные `.env`: [docs/ASR_START_ANALYSIS.md](docs/ASR_START_ANALYSIS.md)
+- **Роли и шаблоны оператора** («спасибо за обращение» и т.п.): [docs/CALL_CENTER_ROLE_ANCHORS.md](docs/CALL_CENTER_ROLE_ANCHORS.md)
 
 ## Что умеет
 
 - Загружает аудиофайлы (`wav/mp3/m4a/ogg/flac`)
 - Транскрибирует звонки локально (`faster-whisper`)
-- Поддерживает 2 RU ASR-профиля: `medium_ru` / `ideal_ru`
+- Поддерживает RU ASR-профили: `medium_ru` / `ideal_ru` / `ultima_ru` (**Ultima** — `whisper-large-v3-russian` с Hugging Face)
 - **LLM пост-редактор**: по умолчанию **встроенная** лёгкая [DeepSeek-R1-Distill-Qwen-1.5B](https://huggingface.co/deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B) через `transformers` (скачивание с Hugging Face при первом запуске, ~3.5 ГБ); опционально внешний OpenAI-compatible API (Ollama, LM Studio)
 - Опционально **локальный пунктуатор** (`deepmultilingualpunctuation`) без LLM
 - Оценивает диалоги локально (`CallQualityEvaluator` в `transcription.py`) и/или облаком (`llm_cloud_eval.py`)
@@ -59,10 +61,11 @@ python scripts/patch_streamlit_file_uploader_ru.py
 
 ## Рекомендованные ASR настройки (8GB RAM)
 
-- В **Streamlit** по умолчанию выбрано **Максимум** (Large-v3 + `ideal_ru`); для слабых ПК переключите на **Стандарт**.
+- В **Streamlit** по умолчанию выбрано **Максимум** (Large-v3 + `ideal_ru` + тяжёлая диаризация); **Ultima** — та же мощная связка decode + heavy, но модель RU fine-tuned с HF (`CALLQA_WHISPER_MODEL_ULTIMA`); для слабых ПК — **Стандарт**.
 - `ASR профиль: medium_ru` + модель `medium` (средний режим)
-- `ASR профиль: ideal_ru` + модель `large-v3` (идеальный режим)
-- Для максимальной стабильности ролей включайте `Max Quality RU (heavy)`.
+- `ASR профиль: ideal_ru` + модель `large-v3` (максимум, Systran)
+- `ASR профиль: ultima_ru` + модель из `CALLQA_WHISPER_MODEL_ULTIMA` (по умолчанию `bzikst/faster-whisper-large-v3-russian`)
+- Для максимальной стабильности ролей — пресет **Максимум** (там heavy по умолчанию) или heavy в CLI для нужного профиля.
 - В Streamlit по умолчанию включён **LLM пост-редактор** (встроенная модель с Hugging Face, отдельное приложение не нужно). На CPU первый прогон может быть долгим — увеличьте таймаут в боковой панели. Локальный пунктуатор — запасной вариант без LLM.
 - Внешний API: в UI выберите «Внешний API» или задайте `LLM_POST_EDIT_BASE_URL` / `LLM_POST_EDIT_MODEL` в `.env` (Ollama: `ollama serve` + `ollama pull …`).
 

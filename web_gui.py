@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+# До streamlit и любого импорта speechbrain: torchaudio 2.2+ и фильтр шумных варнингов SB.
+from speechbrain_compat import apply_speechbrain_environment
+
+apply_speechbrain_environment()
+
 import io
 import os
 import re
@@ -35,6 +40,7 @@ from transcription import (
     Transcriber,
     TranscriptionResult,
     build_report,
+    resolve_ultima_whisper_model,
 )
 
 _MANUAL_WAIT_INPUT_RE = re.compile(
@@ -602,7 +608,7 @@ def render_gauge(score: int) -> None:
             paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
             font={"family": "Inter"},
         )
-        st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+        st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
     except ImportError:
         # fallback если plotly не установлен
         st.metric("Итоговая оценка", f"{score}/10")
@@ -780,34 +786,92 @@ def _update_transcription_progress_from_log(
     """
     Обновляет state по строке лога.
     Возвращает (текст для st.progress или None, обновлять ли полосу шагов).
+
+    Логи транскрибера: ``[transcriber] [этап: имя] сообщение`` (см. transcription.Transcriber._stage).
     """
-    m = message.lower()
-    if "загружаю модель" in m:
-        state.current_step, state.done_steps, state.current_progress = 0, 0, 10
-        return "Загружаю модель распознавания...", True
-    if "модель загружена" in m:
-        state.current_step, state.done_steps, state.current_progress = 1, 1, 25
-        return "Модель загружена", True
-    if "распознаю речь" in m:
-        state.current_step, state.current_progress = 1, 50
-        return "Распознаю речь...", True
-    if "обработано сегментов" in m:
-        state.current_progress = min(85, max(state.current_progress, 50) + 4)
-        return "Распознаю речь...", False
-    if "текст собран" in m or "распознавание завершено" in m:
-        state.current_step, state.done_steps, state.current_progress = 2, 2, 87
-        return "Определяю роли спикеров...", True
+    m = (message or "").lower()
+
+    # Старт пайплайна — даём ненулевой %, чтобы таймер ETA мог экстраполировать
+    if "[этап: начало]" in m:
+        state.current_progress = max(state.current_progress, 4)
+        return "Открываю файл и запускаю пайплайн...", False
+    if "[этап: asr-параметры]" in m:
+        state.current_progress = max(state.current_progress, 6)
+        return "Параметры распознавания...", False
+    if "[этап: asr-модель]" in m and "загрузка" in m:
+        state.current_step, state.done_steps, state.current_progress = 0, 0, 12
+        return "Загрузка модели Whisper (может быть долго при первом запуске)...", True
+    if "[этап: asr-модель]" in m and ("готова" in m or "уже в памяти" in m):
+        state.current_step, state.done_steps, state.current_progress = 1, 1, 28
+        return "Модель готова", True
+    if "[этап: пропуск ожидания]" in m or "[этап: аудио]" in m:
+        state.current_progress = max(state.current_progress, 18)
+        return "Подготовка аудио (обрезка, нормализация)...", False
+    if "[этап: whisper]" in m and "запуск" in m:
+        state.current_step, state.done_steps, state.current_progress = 1, 1, 38
+        return "Whisper: признаки и VAD...", True
+    if "[этап: whisper]" in m and "декодирование сегментов" in m:
+        state.current_step, state.done_steps, state.current_progress = 1, 1, 52
+        return "Распознавание речи (декодирование)...", True
+    if "asr прогресс:" in m:
+        state.current_progress = min(84, max(state.current_progress, 52) + 3)
+        return "Распознавание речи...", False
+    if "распознавание завершено" in m:
+        state.current_step, state.done_steps, state.current_progress = 1, 2, 86
+        return "Распознавание завершено", True
+    if "[этап: роли]" in m and "черновик" in m:
+        state.current_step, state.done_steps = 2, 2
+        state.current_progress = max(state.current_progress, 87)
+        return "Определяю роли (черновик по тексту)...", True
+    if (
+        ("[этап: роли/" in m or "[этап: роли/ecapa" in m)
+        and "ошибка" not in m
+    ):
+        state.current_step, state.done_steps = 2, 2
+        state.current_progress = max(state.current_progress, 88)
+        return "Разделение ролей (голос / диаризация)...", True
+    if "[этап: роли+голос]" in m and "совмещение" in m:
+        state.current_step, state.done_steps = 2, 2
+        state.current_progress = max(state.current_progress, 89)
+        return "Совмещение голоса и текста...", True
+    if "[этап: роли+голос]" in m and "блок завершён" in m:
+        state.current_step, state.done_steps, state.current_progress = 3, 3, 91
+        return "Роли определены", True
+    if "[этап: llm]" in m or (
+        "[этап: llm-постредактор]" in m and "выключен" not in m and "не сработал" not in m
+    ):
+        state.current_step = 3
+        state.current_progress = max(state.current_progress, 92)
+        return "AI: пост-редактура транскрипта...", True
+    if "llm пост-редактор (" in m:
+        state.current_step = 3
+        state.current_progress = max(state.current_progress, 93)
+        return "AI: пост-редактура...", False
+    if "[этап: локальный пост]" in m and "выключен" not in m and "пропуск" not in m:
+        state.current_step = 3
+        state.current_progress = max(state.current_progress, 93)
+        return "Локальная пунктуация и роли...", True
+    if "[этап: сборка отчёта]" in m:
+        state.current_progress = max(state.current_progress, 94)
+        return "Сборка расшифровки по ролям...", False
+    if "текст собран" in m:
+        state.current_progress = max(state.current_progress, 95)
+        return "Текст и роли собраны", False
     if "сформирована расшифровка по ролям" in m:
-        state.current_step, state.done_steps, state.current_progress = 3, 3, 90
-        return "Транскрипт готов", True
-    if "llm пост-редактор" in m:
-        state.current_step, state.current_progress = 3, max(state.current_progress, 90)
-        return "Обрабатываю текст через Яндекс AI...", True
+        state.current_step, state.done_steps = 3, 3
+        state.current_progress = max(state.current_progress, 96)
+        return "Транскрипт по ролям готов", True
+    if "[этап: тональность]" in m and "анализ" in m:
+        state.current_progress = max(state.current_progress, 97)
+        return "Анализ тональности...", False
+    if "[этап: готово]" in m:
+        state.current_progress = max(state.current_progress, 98)
+        return "Завершение распознавания...", False
     if "[evaluator] оцениваю" in m:
-        state.current_step, state.done_steps, state.current_progress = 4, 4, 95
-        return "Оцениваю качество...", True
+        state.current_step, state.done_steps, state.current_progress = 4, 4, 96
+        return "Оцениваю качество консультации...", True
     if "[evaluator] оценка готова" in m:
-        state.current_step, state.done_steps, state.current_progress = 4, 5, 98
+        state.current_step, state.done_steps, state.current_progress = 4, 5, 99
         return "Формирую отчёт...", True
     return None, False
 
@@ -1021,27 +1085,40 @@ def render_sidebar() -> tuple[bool, object | None]:
         st.markdown("**Распознавание речи**")
         quality = st.radio(
             "Качество",
-            # Первый пункт — значение по умолчанию (Максимум)
-            options=["max", "standard"],
-            format_func=lambda x: (
-                "🎯 Максимум (~5–15 мин)" if x == "max" else "⚡ Стандарт (~2–5 мин)"
-            ),
+            # Первый пункт — значение по умолчанию (Ultima)
+            options=["ultima", "max", "standard"],
+            format_func=lambda x: {
+                "max": "🎯 Максимум (~12–22 мин)",
+                "standard": "⚡ Стандарт (~1–3 мин)",
+                "ultima": "🔮 Ultima (~7–12 мин, RU Large-v3)",
+            }[x],
             horizontal=True,
             help=(
-                "Стандарт: Whisper Medium, int8. "
-                "Максимум: Whisper Large-v3, ideal_ru (широкий луч + анти-повторы); на Mac без GPU "
-                "автоматически int8_float32/float32 на CPU — стабильнее, чем float16."
+                "Стандарт: Whisper Medium, int8; быстро, достаточно для большинства звонков. "
+                "Максимум: Systran Large-v3 + beam 9/best_of 5 + 3 температуры; максимальное качество. "
+                "Ultima: fine-tuned whisper-large-v3-russian; beam 9/best_of 4/patience 1.1 + 3 температуры; "
+                "спектральный денойз (SNR↑ для тихой/шумной речи); "
+                "сверхчувствительный VAD pad=2000ms (не режет первые слова); "
+                "no_speech_threshold=0.82, log_prob=-1.2 (декодирует даже тихие вступления); "
+                "плотная диаризация: окна 2.4с/шаг 0.6с, взвешенный vote. На Mac без GPU — int8_float32."
             ),
         )
         if quality == "standard":
             model_name, compute_type, asr_profile, heavy_mode = "medium", "int8", "medium_ru", False
+        elif quality == "ultima":
+            model_name, compute_type, asr_profile, heavy_mode = (
+                resolve_ultima_whisper_model(),
+                "int8_float32",
+                "ultima_ru",
+                True,
+            )
         else:
-            model_name, compute_type, asr_profile, heavy_mode = "large-v3", "float16", "ideal_ru", True
+            model_name, compute_type, asr_profile, heavy_mode = "large-v3", "int8_float32", "ideal_ru", True
 
         with st.expander("Тонкая настройка", expanded=False):
             heavy_timeout = st.slider(
                 "Таймаут диаризации (сек)",
-                min_value=90, max_value=300, value=240, step=10,
+                min_value=90, max_value=300, value=150, step=10,
             )
             enable_post_edit = st.checkbox(
                 "Локальный пунктуатор",
@@ -1253,10 +1330,10 @@ def _render_single_tab(
     btn_col1, btn_col2 = st.columns([5, 1])
     with btn_col1:
         start_clicked = st.button(
-            "🚀  Запустить анализ", type="primary", use_container_width=True,
+            "🚀  Запустить анализ", type="primary", width="stretch",
         )
     with btn_col2:
-        stop_clicked = st.button("⏹ Стоп", type="secondary", use_container_width=True)
+        stop_clicked = st.button("⏹ Стоп", type="secondary", width="stretch")
 
     if stop_clicked:
         st.session_state["stop_requested"] = True
@@ -1345,14 +1422,24 @@ def _render_single_tab(
         while not _stop_timer.wait(1.0):
             elapsed = time.perf_counter() - started_at
             pct = progress_state.current_progress
-            if pct > 0:
-                remaining = elapsed * (100 - pct) / pct
+            if pct <= 0:
                 eta_placeholder.caption(
                     f"⏱ Прошло: **{_format_eta(elapsed)}** · "
-                    f"Осталось примерно: **{_format_eta(remaining)}**"
+                    "ожидание первых этапов лога (долгая загрузка модели — норма)…"
+                )
+            elif pct < 6:
+                # При 1–5% линейная экстраполяция даёт огромный «остаток»
+                eta_placeholder.caption(
+                    f"⏱ Прошло: **{_format_eta(elapsed)}** · "
+                    "осталось: **уточняется…** (ранняя стадия)"
                 )
             else:
-                eta_placeholder.caption(f"⏱ Прошло: **{_format_eta(elapsed)}**")
+                remaining = elapsed * (100 - pct) / max(pct, 1)
+                remaining = min(remaining, 3_600.0)  # не показываем > 1 ч от одной экстраполяции
+                eta_placeholder.caption(
+                    f"⏱ Прошло: **{_format_eta(elapsed)}** · "
+                    f"осталось примерно: **{_format_eta(remaining)}**"
+                )
 
     _timer_thread = threading.Thread(target=_eta_timer_loop, daemon=True, name="eta_timer")
     _timer_thread.start()
@@ -1489,7 +1576,7 @@ def _render_single_tab(
             data=report.encode("utf-8"),
             file_name=f"{Path(uploaded_file.name).stem}_report.txt",
             mime="text/plain",
-            use_container_width=True,
+            width="stretch",
         )
 
     # 6. Техническая диагностика
@@ -1620,7 +1707,7 @@ def _render_live_batch_table(
         style = df.style.applymap(_color_score, subset=["Итог"]).applymap(
             _color_review, subset=["Прослушать"]
         )
-        placeholder.dataframe(style, use_container_width=True, hide_index=True)
+        placeholder.dataframe(style, width="stretch", hide_index=True)
     except ImportError:
         lines = [f"{r['№']}. {r['original_filename']} — {r['total_score']}/10" for r in collected]
         placeholder.text("\n".join(lines))
@@ -1727,14 +1814,14 @@ def render_batch_tab(
         start_batch = st.button(
             "🚀 Запустить пакетный анализ",
             type="primary",
-            use_container_width=True,
+            width="stretch",
             key="batch_start",
             disabled=not _can_start_batch,
         )
     if valid_batch_files and batch_operator_resolved is None:
         st.warning("Выберите оператора из списка, чтобы запустить пакетный анализ.")
     with btn_col2:
-        if st.button("🗑 Очистить", use_container_width=True, key="batch_clear"):
+        if st.button("🗑 Очистить", width="stretch", key="batch_clear"):
             st.session_state["batch_results"] = []
             st.session_state["batch_errors"] = {}
             st.rerun()
@@ -2096,7 +2183,7 @@ def render_batch_tab(
             .applymap(color_score, subset=score_cols)
             .applymap(color_review, subset=["Прослушать"])
         )
-        st.dataframe(styled, use_container_width=True, hide_index=True)
+        st.dataframe(styled, width="stretch", hide_index=True)
 
         # Статус Google Таблицы
         if sheets_configured:
@@ -2120,7 +2207,7 @@ def render_batch_tab(
             data=csv_buf.getvalue().encode("utf-8-sig"),
             file_name="qa_batch_results.csv",
             mime="text/csv",
-            use_container_width=True,
+            width="stretch",
             key="batch_csv",
         )
 

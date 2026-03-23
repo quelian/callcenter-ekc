@@ -744,8 +744,8 @@ def run_yandex_post_edit(
             system_prompt=_PE_SYS,
             user_content=user_content,
             cfg=cfg,
-            max_tokens=8192,
-            temperature=0.1,
+            max_tokens=16_384,
+            temperature=0.08,
         )
     except urllib.error.HTTPError as exc:
         try:

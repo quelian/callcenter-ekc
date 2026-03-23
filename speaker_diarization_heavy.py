@@ -12,6 +12,7 @@ class _Chunk:
     start: float
     end: float
     parent_idx: int
+    duration: float  # для взвешенного голосования
 
 
 def _forced_bipartition_labels(vectors: np.ndarray) -> np.ndarray:
@@ -37,6 +38,32 @@ def _normalize(v: np.ndarray) -> np.ndarray:
     return v / norm
 
 
+def _temporal_smooth_labels(
+    labels: np.ndarray,
+    chunks: list[_Chunk],
+    *,
+    min_island_sec: float = 0.5,
+) -> np.ndarray:
+    """Убираем короткие «острова» — сегменты, где один кластер окружён другим.
+
+    Алгоритм: проходим по временно̀й последовательности; если сегмент <min_island_sec
+    полностью окружён противоположным кластером — перекрашиваем его в кластер соседей.
+    Делаем 2 прохода (возможны каскадные правки).
+    """
+    n = len(labels)
+    if n < 3:
+        return labels
+    out = labels.copy()
+    for _ in range(2):
+        for i in range(1, n - 1):
+            dur = chunks[i].duration
+            if dur >= min_island_sec:
+                continue
+            if out[i - 1] == out[i + 1] and out[i] != out[i - 1]:
+                out[i] = out[i - 1]
+    return out
+
+
 def run_heavy_diarization(
     audio_path: str,
     target_speakers: int = 2,
@@ -47,6 +74,7 @@ def run_heavy_diarization(
         "split_mode": "native",
         "window_count": 0,
         "valid_regions": 0,
+        "cluster_quality": 0.0,
         "elapsed_seconds": 0.0,
     }
     started = time.perf_counter()
@@ -54,19 +82,16 @@ def run_heavy_diarization(
         return [], "heavy diarization supports only 2 speakers", diagnostics
     try:
         import librosa
-        import torch
         from sklearn.cluster import AgglomerativeClustering
-        # SpeechBrain 1.x calls torchaudio.list_audio_backends() which was removed in
-        # torchaudio 2.2+.  Patch it with a stub before importing speechbrain.
-        try:
-            import torchaudio as _ta
-            if not hasattr(_ta, "list_audio_backends"):
-                _ta.list_audio_backends = lambda: []
-        except Exception:
-            pass
-        from speechbrain.inference.speaker import EncoderClassifier
     except Exception as exc:
         return [], f"не удалось импортировать heavy зависимости: {exc}", diagnostics
+
+    # Используем кешированную ECAPA-модель (MPS на M1, иначе CPU) вместо загрузки новой.
+    try:
+        from speaker_voice_roles import _load_ecapa_model, _embed_windows_ecapa, _normalize_rows
+        model = _load_ecapa_model()
+    except Exception as exc:
+        return [], f"не удалось загрузить heavy speaker model: {exc}", diagnostics
 
     try:
         wav, sr = librosa.load(audio_path, sr=16000, mono=True)
@@ -75,81 +100,119 @@ def run_heavy_diarization(
     if wav.size == 0:
         return [], "пустое аудио", diagnostics
 
-    split = librosa.effects.split(wav, top_db=35)
+    # top_db=28: не срезаем тихие реплики (шёпот, «алло» в начале).
+    # top_db=24 для heavy режима — ещё чувствительнее, чем лёгкий.
+    split = librosa.effects.split(wav, top_db=24)
     regions: list[tuple[float, float]] = []
     for s, e in split.tolist():
         ss = float(s) / 16000.0
         ee = float(e) / 16000.0
-        if ee - ss >= 0.40:
+        # 0.25 с — ловим очень короткие реплики (вопросы, «да»/«нет»)
+        if ee - ss >= 0.25:
             regions.append((ss, ee))
     if not regions:
         return [], "не найдено голосовых регионов", diagnostics
 
+    # Склеиваем паузы ≤ 0.15 с — один говорящий часто делает микропаузы.
     merged: list[tuple[float, float]] = []
     for s, e in regions:
-        if not merged or s - merged[-1][1] > 0.22:
+        if not merged or s - merged[-1][1] > 0.15:
             merged.append((s, e))
         else:
             merged[-1] = (merged[-1][0], e)
     diagnostics["valid_regions"] = len(merged)
 
+    # Нарезаем на окна 2.4 с с шагом 0.8 с (было 1.0 с) — плотнее покрываем смены спикера, но не перегружаем.
+    WIN_SEC = 2.4
+    STEP_SEC = 0.8
+    MIN_WIN_SEC = 0.6  # минимальный размер окна
+
     chunks: list[_Chunk] = []
     for idx, (s, e) in enumerate(merged):
         cur = s
         while cur < e:
-            win_end = min(e, cur + 2.4)
-            if win_end - cur >= 0.8:
-                chunks.append(_Chunk(start=cur, end=win_end, parent_idx=idx))
-            cur += 1.0
+            win_end = min(e, cur + WIN_SEC)
+            dur = win_end - cur
+            if dur >= MIN_WIN_SEC:
+                chunks.append(_Chunk(start=cur, end=win_end, parent_idx=idx, duration=dur))
+            cur += STEP_SEC
     if not chunks:
         return [], "не удалось сформировать окна для embedding", diagnostics
     diagnostics["window_count"] = len(chunks)
 
-    try:
-        model = EncoderClassifier.from_hparams(
-            source="speechbrain/spkrec-ecapa-voxceleb",
-            savedir="pretrained_models/spkrec-ecapa-voxceleb",
-            run_opts={"device": "cpu"},
-        )
-    except Exception as exc:
-        return [], f"не удалось загрузить heavy speaker model: {exc}", diagnostics
+    if time.perf_counter() - started > max_seconds:
+        diagnostics["elapsed_seconds"] = round(time.perf_counter() - started, 3)
+        return [], f"таймаут heavy diarization ({max_seconds}s) до embedding", diagnostics
 
-    emb_rows: list[np.ndarray] = []
+    # Батчевый инференс через _embed_windows_ecapa (MPS/CPU, нормализация волны).
+    win_samp = int(WIN_SEC * 16000)
+    windows: list[np.ndarray] = []
+    valid_chunks: list[_Chunk] = []
     for ch in chunks:
-        if time.perf_counter() - started > max_seconds:
-            diagnostics["elapsed_seconds"] = round(time.perf_counter() - started, 3)
-            return [], f"таймаут heavy diarization ({max_seconds}s)", diagnostics
         seg = wav[int(ch.start * 16000) : int(ch.end * 16000)]
-        if seg.size < 1600:
+        if seg.size < int(0.25 * 16000):
             continue
-        tens = torch.tensor(seg, dtype=torch.float32).unsqueeze(0)
-        with torch.no_grad():
-            emb = model.encode_batch(tens).squeeze().detach().cpu().numpy()
-        emb_rows.append(_normalize(emb))
+        peak = float(np.max(np.abs(seg)) + 1e-8)
+        windows.append((seg / peak).astype(np.float32))
+        valid_chunks.append(ch)
 
-    if len(emb_rows) < 4:
+    if not windows:
+        diagnostics["elapsed_seconds"] = round(time.perf_counter() - started, 3)
+        return [], "нет валидных окон после фильтрации", diagnostics
+
+    try:
+        embs = _embed_windows_ecapa(model, windows, win_samp, batch_size=64)
+        embs = _normalize_rows(embs)
+    except Exception as exc:
+        diagnostics["elapsed_seconds"] = round(time.perf_counter() - started, 3)
+        return [], f"ошибка embedding: {exc}", diagnostics
+
+    chunks = valid_chunks
+    if len(embs) < 4:
         diagnostics["elapsed_seconds"] = round(time.perf_counter() - started, 3)
         return [], "слишком мало валидных голосовых окон", diagnostics
 
-    emb = np.vstack(emb_rows)
     try:
-        labels = AgglomerativeClustering(n_clusters=2, linkage="average").fit_predict(emb)
+        labels = AgglomerativeClustering(n_clusters=2, metric="cosine", linkage="average").fit_predict(embs)
     except Exception:
-        labels = _forced_bipartition_labels(emb)
+        labels = _forced_bipartition_labels(embs)
         diagnostics["split_mode"] = "forced"
     if len(set(labels.tolist())) < 2:
-        labels = _forced_bipartition_labels(emb)
+        labels = _forced_bipartition_labels(embs)
         diagnostics["split_mode"] = "forced"
 
-    votes: dict[int, list[int]] = defaultdict(list)
+    # Качество кластеров: inter / intra cosine distance.
+    clusters_embs: dict[int, list[np.ndarray]] = {}
+    for i, lbl in enumerate(labels.tolist()):
+        clusters_embs.setdefault(int(lbl), []).append(embs[i])
+    c_ids = list(clusters_embs.keys())
+    if len(c_ids) >= 2:
+        centroids = {cid: np.mean(vs, axis=0) for cid, vs in clusters_embs.items()}
+        for cid in centroids:
+            n = float(np.linalg.norm(centroids[cid]))
+            centroids[cid] = centroids[cid] / (n + 1e-8)
+        inter = 1.0 - float(np.dot(centroids[c_ids[0]], centroids[c_ids[1]]))
+        intra_vals = []
+        for cid, vecs in clusters_embs.items():
+            for v in vecs:
+                intra_vals.append(1.0 - float(np.dot(v, centroids[cid])))
+        intra = float(np.mean(intra_vals)) if intra_vals else 1.0
+        diagnostics["cluster_quality"] = inter / (intra + 1e-6)
+
+    # Временно̀е сглаживание: убираем короткие «острова» не того кластера.
+    labels = _temporal_smooth_labels(np.asarray(labels, dtype=np.int32), chunks, min_island_sec=0.5)
+
+    # Взвешенное голосование: более длинные окна получают больший вес.
+    # Это точнее чем simple majority при разной длине окон.
+    votes_w: dict[int, dict[int, float]] = defaultdict(lambda: defaultdict(float))
     for ch, label in zip(chunks, labels.tolist()):
-        votes[ch.parent_idx].append(int(label))
+        votes_w[ch.parent_idx][int(label)] += ch.duration
 
     turns: list[tuple[float, float, str]] = []
     for idx, (s, e) in enumerate(merged):
-        if idx not in votes:
+        if idx not in votes_w:
             continue
-        label = Counter(votes[idx]).most_common(1)[0][0]
+        label = max(votes_w[idx], key=lambda k: votes_w[idx][k])
         turns.append((s, e, f"SPK_{label}"))
     if len(turns) < 2:
         diagnostics["elapsed_seconds"] = round(time.perf_counter() - started, 3)
