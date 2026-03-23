@@ -1,0 +1,16 @@
+.env
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.DS_Store
+*-google-sheets*.json
+*-service-account*.json
+keygoogle.json
+
+# Симлинки SpeechBrain → ~/.cache/huggingface (только локально, на других ПК не работают)
+pretrained_models/
+
+# Отчёты по звонкам (генерируются приложением)
+результаты/

@@ -1,0 +1,99 @@
+(async function downloadCallRecordings() {
+  const DELAY_MS = 800;
+
+  function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  // Форматируем номер из 11 цифр в вид "7 (902) 556-73-27"
+  function formatPhone(digits) {
+    // digits = "79025567327"
+    if (digits.length === 11 && digits.startsWith('7')) {
+      return `7 (${digits.slice(1,4)}) ${digits.slice(4,7)}-${digits.slice(7,9)}-${digits.slice(9,11)}`;
+    }
+    return digits;
+  }
+
+  const downloadLinks = document.querySelectorAll('a[href*="/api/v2/call-records/download/"]');
+
+  if (downloadLinks.length === 0) {
+    console.warn('⚠️ Ссылки для скачивания не найдены! Убедитесь что записи загружены на странице.');
+    return;
+  }
+
+  console.log(`✅ Найдено записей: ${downloadLinks.length}`);
+
+  let successCount = 0;
+  let errorCount = 0;
+
+  for (let i = 0; i < downloadLinks.length; i++) {
+    const link = downloadLinks[i];
+
+    try {
+      const href = link.href;
+
+      // Извлекаем дату из URL: /download/2026-02-12/
+      const dateMatch = href.match(/\/download\/(\d{4})-(\d{2})-(\d{2})\//);
+      const dateStr = dateMatch ? `${dateMatch[3]}-${dateMatch[2]}-${dateMatch[1]}` : 'unknown';
+
+      // Извлекаем имя файла из URL
+      const fileNameMatch = href.match(/\/([^\/]+\.mp3)$/);
+      const originalFileName = fileNameMatch ? fileNameMatch[1] : '';
+
+      // Телефон клиента — первые цифры до "_in_" или "_out_"
+      // Пример: 79025567327_in_79242313551_2026_02_12-13_20_27_phca.mp3
+      const phoneMatch = originalFileName.match(/^(\d+)_(in|out)_/);
+      const phone = phoneMatch ? formatPhone(phoneMatch[1]) : 'unknown';
+
+      // Ожидание — ищем ссылку в родительской строке
+      // Ищем DOM-строку: берём ближайший контейнер строки
+      const row = link.closest('tr') ||
+                  link.closest('[class*="row"]') ||
+                  link.closest('[class*="Row"]') ||
+                  link.closest('[class*="call"]') ||
+                  link.closest('[class*="Call"]') ||
+                  link.parentElement?.parentElement?.parentElement;
+
+      let waitTime = '00-00';
+      if (row) {
+        // Ищем все элементы с текстом формата MM:SS
+        const allEls = row.querySelectorAll('*');
+        const timeCells = Array.from(allEls).filter(el =>
+          el.children.length === 0 && /^\d{2}:\d{2}$/.test(el.innerText?.trim())
+        );
+        // Порядок колонок: Начало, Ожидание, Длительность
+        // Ожидание — второй элемент времени
+        if (timeCells.length >= 2) {
+          waitTime = timeCells[1].innerText.trim().replace(':', '-');
+        }
+      }
+
+      const safeName = `${dateStr}_${phone}_${waitTime}.mp3`;
+
+      console.log(`[${i+1}/${downloadLinks.length}] ${safeName}`);
+
+      const response = await fetch(href, { credentials: 'include' });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+
+      const blob = await response.blob();
+      const url = URL.createObjectURL(blob);
+
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = safeName;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+
+      successCount++;
+      await sleep(DELAY_MS);
+
+    } catch (err) {
+      console.error(`❌ Ошибка при скачивании записи ${i+1}:`, err);
+      errorCount++;
+    }
+  }
+
+  console.log(`\n🎉 Готово! Скачано: ${successCount}, ошибок: ${errorCount}`);
+})();
