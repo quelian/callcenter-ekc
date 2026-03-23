@@ -4,7 +4,8 @@
 
 **Текущая версия:** Beta 1.0 (23.03.2026) — см. [CHANGELOG.md](CHANGELOG.md).
 
-Клонирование с GitHub и первый `push`: см. [docs/GITHUB_SETUP.md](docs/GITHUB_SETUP.md).
+- **Windows (скачать с GitHub, cmd, запуск):** [docs/WINDOWS.md](docs/WINDOWS.md)  
+- **GitHub:** первый push и синхронизация — [docs/GITHUB_SETUP.md](docs/GITHUB_SETUP.md)
 
 ## Что умеет
 
@@ -30,47 +31,20 @@
 
 ## Быстрый старт
 
-Команды ниже вводите в **терминале** (не в `python` / не там, где приглашение `>>>`).
+Команды вводите в **терминале**, не внутри Python (`>>>`).
 
-### macOS / Linux (bash, zsh)
+**Windows** — пошагово: **[docs/WINDOWS.md](docs/WINDOWS.md)** (ZIP с GitHub или `git clone`, `venv`, `pip`, `run_web_gui.bat`).
 
-1. Создайте и активируйте виртуальное окружение:
+### macOS / Linux
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-```
-
-2. Зависимости и запуск:
-
-```bash
 pip install -r requirements.txt
 streamlit run web_gui.py
 ```
 
-### Windows (Командная строка cmd)
-
-В **cmd** команды **`source`** нет (она только для bash/zsh).
-
-1. Откройте cmd, перейдите в папку проекта (`cd путь\к\callcenter-qa-app`).
-2. Выполните:
-
-```bat
-python -m venv .venv
-.venv\Scripts\activate.bat
-pip install -r requirements.txt
-python -m streamlit run web_gui.py
-```
-
-Если `python` не находится, попробуйте `py -m venv .venv` и дальше после активации тот же `pip` / `python` из `.venv`.
-
-**Проще:** после шага с `pip install` можно не активировать venv вручную — дважды запустите **`run_web_gui.bat`** (он сам вызовет `activate.bat` и Streamlit).
-
-### Windows (PowerShell)
-
-Активация: `.\.venv\Scripts\Activate.ps1` (если спросит политику выполнения: `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` один раз). Далее `pip install -r requirements.txt` и `python -m streamlit run web_gui.py`.
-
-**Админ-панель** (в сайдбаре): смена ключа Yandex AI (`YANDEX_API_KEY`, `YANDEX_FOLDER_ID`) и ссылки/ID Google Таблицы — только после входа по паролю (по умолчанию **`9632`**, переопределение: `ADMIN_PANEL_PASSWORD` в `.env`). Значения сохраняются в `.env`.
+**Админ-панель** (сайдбар): ключи Yandex и таблица Google — только после пароля (по умолчанию **`9632`**; свой пароль: `ADMIN_PANEL_PASSWORD` в `.env`). Сохранение в `.env`.
 
 ### Интерфейс загрузки файлов (русский + 5 файлов на страницу)
 
@@ -142,7 +116,7 @@ python transcription.py /path/to/call.wav --asr-profile medium_ru --enable-post-
 
 1. [Yandex Cloud Console](https://console.yandex.cloud/) → AI Studio → **Создать ключ API** (scope: `yc.ai.languageModels.execute`).
 2. Скопируй **Folder ID** (выпадающий список папок в шапке консоли).
-3. Введи оба значения в поля сайдбара или задай в `.env`:
+3. Задай в `.env` или в **Админ-панели** сайдбара (пароль):
 
 ```
 YANDEX_API_KEY=AQVNw...
