@@ -2004,7 +2004,6 @@ class Transcriber:
         whisper_pieces_rel: list[tuple[float, float, str]] = []
         segment_count = 0
         hallucination_count = 0
-        ivr_tail_hit = False  # once IVR phrase seen, discard everything after
         for segment in segments:
             segment_count += 1
             _now = time.perf_counter()
@@ -2021,11 +2020,10 @@ class Transcriber:
             for seg_start, seg_end, piece in sub_segs:
                 if not piece:
                     continue
-                # Once PBX auto-informer phrase is detected, stop collecting.
+                # Отбрасываем ТОЛЬКО сегменты, содержащие фразы автоинформатора АТС.
+                # Каскада нет — нормальное завершение разговора оператора не трогаем.
                 if _IVR_TAIL_RE.search(piece):
-                    ivr_tail_hit = True
-                    self._log(f"[asr] Отброшен хвост автоинформатора: «{piece[:80]}»")
-                if ivr_tail_hit:
+                    self._log(f"[asr] Отброшен сегмент автоинформатора: «{piece[:80]}»")
                     continue
                 if (
                     len(_prompt_words) >= 3
@@ -2048,7 +2046,7 @@ class Transcriber:
             f"распознавание завершено: сегментов Whisper={segment_count}, символов ≈{len(text)}, "
             f"фрагментов с таймкодами={len(whisper_pieces_rel)}; "
             f"декод {decode_elapsed:.1f} с, всего ASR {asr_elapsed:.1f} с"
-            + ("; IVR-хвост обрезан" if ivr_tail_hit else "")
+            + ""
             + (f"; галлюцинаций отброшено: {hallucination_count}" if hallucination_count else ""),
         )
         info_language = getattr(info, "language", None)
