@@ -1,14 +1,21 @@
 from __future__ import annotations
 
+import os
+import sys
+
+# macOS: при спавне воркеров Streamlit/lib в stderr сыпется
+# «MallocStackLogging: can't turn off...» — задаём режим malloc до нативных импортов.
+if sys.platform == "darwin":
+    # Явно «выкл.»; иначе у потомков иногда остаётся несогласованное состояние и libsystem_malloc шумит в stderr.
+    os.environ["MallocStackLogging"] = "0"
+
 # До streamlit и любого импорта speechbrain: torchaudio 2.2+ и фильтр шумных варнингов SB.
 from speechbrain_compat import apply_speechbrain_environment
 
 apply_speechbrain_environment()
 
 import io
-import os
 import re
-from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 import tempfile
@@ -18,195 +25,59 @@ from typing import Callable
 
 import streamlit as st
 
-_APP_DIR = Path(__file__).resolve().parent
+from analysis_service import (
+    AnalysisRequest,
+    TranscriberSettings,
+    analyze_call,
+    build_sheets_export_payload,
+    create_transcriber,
+)
+from app_config import load_app_environment
+from batch_state import (
+    BatchFileJob,
+    BatchResumeState,
+    batch_resume_files_dir,
+    batch_resume_state_path,
+    clear_batch_resume_state,
+    load_batch_resume_state,
+    save_batch_resume_state,
+)
+from ui_batch_helpers import (
+    format_uploaded_size,
+    render_live_batch_table,
+    result_to_row_dict,
+)
+from ui_progress_helpers import (
+    TranscriptionProgressState,
+    format_eta,
+    make_steps_html,
+    update_transcription_progress_from_log,
+)
+from ui_result_components import (
+    render_checklist,
+    render_feedback,
+    render_gauge,
+    render_header,
+    render_score_card,
+    render_summary,
+    render_transcript,
+    render_verdict,
+)
+from ui_sidebar import render_sidebar
 
 # Версия UI — дублируйте при релизе в CHANGELOG.md
-APP_VERSION_LABEL = "Beta 1.0"
-APP_VERSION_DATE = "23.03.2026"
-try:
-    from dotenv import load_dotenv
-
-    load_dotenv(_APP_DIR / ".env")
-    load_dotenv()
-except ImportError:
-    pass
+APP_VERSION_LABEL = "Beta 1.1"
+APP_VERSION_DATE = "24.03.2026"
+load_app_environment()
 
 from operator_staff import OPERATOR_CANONICAL_NAMES
 from results_paths import ensure_results_dir
 from streamlit_file_uploader_patch import apply_streamlit_file_uploader_localization_patch
-from transcription import (
-    CallQualityEvaluator,
-    QualityEvaluation,
-    Transcriber,
-    TranscriptionResult,
-    build_report,
-    resolve_ultima_whisper_model,
-)
+from transcription import Transcriber
 
 _MANUAL_WAIT_INPUT_RE = re.compile(
     r"^\s*(\d{1,3})\s*[:-]\s*(\d{1,2})\s*$"
 )
-
-# Пароль админ-панели (ключи Yandex + Google Таблица). Переопределение: ADMIN_PANEL_PASSWORD в .env
-_DEFAULT_ADMIN_PANEL_PASSWORD = "9632"
-
-_GOOGLE_SHEET_URL_RE = re.compile(
-    r"docs\.google\.com/spreadsheets/d/([a-zA-Z0-9_-]+)",
-    re.IGNORECASE,
-)
-
-
-def _admin_panel_password() -> str:
-    return (os.environ.get("ADMIN_PANEL_PASSWORD") or _DEFAULT_ADMIN_PANEL_PASSWORD).strip()
-
-
-def _env_file_path() -> Path:
-    return _APP_DIR / ".env"
-
-
-def _dotenv_escape_value(val: str) -> str:
-    """Значение для строки KEY=... в .env (без имени ключа)."""
-    val = val.replace("\n", " ").strip()
-    if re.search(r'[\s#"\'=]', val) or val != val.strip():
-        escaped = val.replace("\\", "\\\\").replace('"', '\\"')
-        return f'"{escaped}"'
-    return val
-
-
-def merge_env_file(updates: dict[str, str]) -> None:
-    """Обновляет или добавляет ключи в .env; прочие строки и комментарии сохраняет."""
-    path = _env_file_path()
-    keys_written: set[str] = set()
-    out_lines: list[str] = []
-    if path.exists():
-        for line in path.read_text(encoding="utf-8").splitlines():
-            raw = line
-            s = line.strip()
-            if not s or s.startswith("#"):
-                out_lines.append(raw)
-                continue
-            if "=" in s:
-                k = s.split("=", 1)[0].strip()
-                if k in updates:
-                    out_lines.append(f"{k}={_dotenv_escape_value(updates[k])}")
-                    keys_written.add(k)
-                    continue
-            out_lines.append(raw)
-    for k, v in updates.items():
-        if k not in keys_written:
-            out_lines.append(f"{k}={_dotenv_escape_value(v)}")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("\n".join(out_lines) + "\n", encoding="utf-8")
-    for k, v in updates.items():
-        os.environ[k] = v
-
-
-def normalize_google_spreadsheet_id(text: str) -> str:
-    """ID из полной ссылки Google Sheets или сырой ID."""
-    t = (text or "").strip()
-    if not t:
-        return ""
-    m = _GOOGLE_SHEET_URL_RE.search(t)
-    if m:
-        return m.group(1)
-    return t
-
-
-def render_admin_panel_sidebar() -> None:
-    """Ключ Yandex, Folder ID и таблица Google — только после ввода пароля; сохранение в .env."""
-    st.divider()
-    with st.expander("🔐 Админ-панель", expanded=False):
-        st.caption(
-            "Ключ API Яндекса и ссылка/ID Google Таблицы можно менять **только здесь** "
-            "(после входа по паролю). Изменения записываются в файл `.env`."
-        )
-
-        if not st.session_state.get("admin_panel_unlocked"):
-            with st.form("admin_login_form", clear_on_submit=False):
-                pwd_in = st.text_input("Пароль администратора", type="password", key="admin_pw_field")
-                login = st.form_submit_button("Войти")
-            if login:
-                if (pwd_in or "").strip() == _admin_panel_password():
-                    st.session_state["admin_panel_unlocked"] = True
-                    st.rerun()
-                else:
-                    st.error("Неверный пароль")
-            return
-
-        from sheets_export import DEFAULT_SPREADSHEET_ID
-
-        yf_cur = (os.environ.get("YANDEX_FOLDER_ID") or "").strip()
-        gs_env = (os.environ.get("GOOGLE_SHEETS_SPREADSHEET_ID") or "").strip()
-        sheet_display = gs_env or DEFAULT_SPREADSHEET_ID
-
-        with st.form("admin_save_form"):
-            st.markdown("**Yandex AI Studio**")
-            new_api = st.text_input(
-                "API Key",
-                value="",
-                type="password",
-                placeholder="Оставьте пустым, чтобы не менять текущий ключ",
-                help="Новое значение сохранится в `.env` (переменная YANDEX_API_KEY).",
-                key="admin_yandex_api",
-            )
-            new_folder = st.text_input(
-                "Folder ID",
-                value=yf_cur,
-                help="YANDEX_FOLDER_ID в консоли Yandex Cloud.",
-                key="admin_yandex_folder",
-            )
-            st.markdown("**Google Таблица**")
-            new_sheet = st.text_input(
-                "Ссылка или ID таблицы",
-                value=sheet_display,
-                help=(
-                    "Вставьте полную ссылку вида "
-                    "https://docs.google.com/spreadsheets/d/…/edit "
-                    f"или только ID. Если в `.env` не задано — сейчас используется ID по умолчанию: `{DEFAULT_SPREADSHEET_ID}`."
-                ),
-                key="admin_sheet_url",
-            )
-            save = st.form_submit_button("Сохранить в .env")
-        if save:
-            updates: dict[str, str] = {}
-            api_stripped = (new_api or "").strip()
-            if api_stripped:
-                updates["YANDEX_API_KEY"] = api_stripped
-            folder_stripped = (new_folder or "").strip()
-            if folder_stripped:
-                updates["YANDEX_FOLDER_ID"] = folder_stripped
-            sid = normalize_google_spreadsheet_id(new_sheet)
-            if sid:
-                updates["GOOGLE_SHEETS_SPREADSHEET_ID"] = sid
-            if not updates:
-                st.warning("Нечего сохранить: укажите новый API Key и/или проверьте Folder ID и таблицу.")
-            else:
-                try:
-                    merge_env_file(updates)
-                    _upd_keys = set(updates)
-                    if _upd_keys & {
-                        "GOOGLE_SHEETS_SPREADSHEET_ID",
-                        "GOOGLE_SHEETS_WORKSHEET",
-                        "GOOGLE_SHEETS_CREDENTIALS_JSON",
-                        "GOOGLE_APPLICATION_CREDENTIALS",
-                    }:
-                        try:
-                            from sheets_export import invalidate_worksheet_cache
-
-                            invalidate_worksheet_cache()
-                        except Exception:
-                            pass
-                    if _upd_keys & {"YANDEX_API_KEY", "YANDEX_FOLDER_ID"}:
-                        st.cache_resource.clear()
-                    st.success("Сохранено. Переменные обновлены для текущего сеанса.")
-                    st.rerun()
-                except OSError as exc:
-                    st.error(f"Не удалось записать `.env`: {exc}")
-
-        if st.button("Выйти из админ-панели", key="admin_logout_btn"):
-            st.session_state["admin_panel_unlocked"] = False
-            st.rerun()
-
 
 def parse_manual_wait_mm_ss(text: str) -> tuple[int, int] | None:
     """
@@ -498,395 +369,6 @@ section[data-testid="stSidebar"] > div {
 """
 
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
-
-def _score_color(score: int) -> str:
-    if score >= 8:
-        return "#22c55e"
-    if score >= 5:
-        return "#f59e0b"
-    return "#ef4444"
-
-
-def _score_label(score: int) -> str:
-    if score >= 8:
-        return "Хорошо"
-    if score >= 5:
-        return "Удовл."
-    return "Слабо"
-
-
-def _score_badge_style(score: int) -> str:
-    if score >= 8:
-        return "background:#dcfce7;color:#16a34a;"
-    if score >= 5:
-        return "background:#fef9c3;color:#b45309;"
-    return "background:#fee2e2;color:#b91c1c;"
-
-
-def render_header() -> None:
-    st.markdown("""
-<div class="qa-header">
-  <div class="qa-header-icon">📞</div>
-  <div>
-    <div class="qa-header-title">Анализ звонков</div>
-    <div class="qa-header-sub">ДВФУ · Единый контактный центр</div>
-  </div>
-</div>""", unsafe_allow_html=True)
-
-
-def render_score_card(col, title: str, score: int, icon: str) -> None:
-    color = _score_color(score)
-    label = _score_label(score)
-    badge_style = _score_badge_style(score)
-    pct = score * 10
-    with col:
-        st.markdown(f"""
-<div class="score-card">
-  <div class="score-title">{icon} {title}</div>
-  <div class="score-value" style="color:{color};">{score}</div>
-  <div class="score-sub">/10</div>
-  <div class="score-bar">
-    <div class="score-fill" style="width:{pct}%; background:{color};"></div>
-  </div>
-  <div><span class="score-badge" style="{badge_style}">{label}</span></div>
-</div>""", unsafe_allow_html=True)
-
-
-def render_summary(evaluation: QualityEvaluation) -> None:
-    color = _score_color(evaluation.total_score)
-    op = evaluation.operator_name or "Не определено"
-    app = evaluation.applicant_name or "Не определено"
-    op_badge = "" if evaluation.operator_in_staff else " ⚠️"
-    st.markdown(f"""
-<div class="summary-card">
-  <div>
-    <div class="summary-person-label">Оператор</div>
-    <div class="summary-person-name">{op}{op_badge}</div>
-  </div>
-  <div>
-    <div class="summary-person-label">Заявитель</div>
-    <div class="summary-person-name">{app}</div>
-  </div>
-  <div class="summary-score-wrap">
-    <div class="summary-score-label">Итоговая оценка</div>
-    <div class="summary-score-val" style="color:{color};">
-      {evaluation.total_score}<span class="summary-score-denom">/10</span>
-    </div>
-  </div>
-</div>""", unsafe_allow_html=True)
-
-
-def render_gauge(score: int) -> None:
-    try:
-        import plotly.graph_objects as go
-
-        fig = go.Figure(go.Indicator(
-            mode="gauge+number",
-            value=score,
-            number={"font": {"size": 52, "family": "Inter"}, "suffix": "/10"},
-            gauge={
-                "axis": {"range": [0, 10], "tickwidth": 1, "tickcolor": "#e5e7eb",
-                         "tickfont": {"size": 11}},
-                "bar": {"color": _score_color(score), "thickness": 0.28},
-                "bgcolor": "#f9fafb",
-                "borderwidth": 0,
-                "steps": [
-                    {"range": [0, 5],  "color": "#fee2e2"},
-                    {"range": [5, 8],  "color": "#fef9c3"},
-                    {"range": [8, 10], "color": "#dcfce7"},
-                ],
-                "threshold": {
-                    "line": {"color": _score_color(score), "width": 3},
-                    "thickness": 0.75,
-                    "value": score,
-                },
-            },
-        ))
-        fig.update_layout(
-            height=220, margin={"t": 20, "b": 10, "l": 20, "r": 20},
-            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-            font={"family": "Inter"},
-        )
-        st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
-    except ImportError:
-        # fallback если plotly не установлен
-        st.metric("Итоговая оценка", f"{score}/10")
-
-
-def render_verdict(evaluation: QualityEvaluation, tone_summary: str) -> None:
-    needs_review, reasons = requires_manual_review(evaluation, tone_summary)
-    if needs_review:
-        reasons_html = f'<div class="verdict-reasons">Причины: {", ".join(reasons)}</div>'
-        st.markdown(f"""
-<div class="verdict-bad">
-  <span style="font-size:22px;">⚠️</span>
-  <div><div>Требует ручной проверки</div>{reasons_html}</div>
-</div>""", unsafe_allow_html=True)
-    else:
-        st.markdown("""
-<div class="verdict-ok">
-  <span style="font-size:22px;">✅</span>
-  <div>Автопроверка пройдена — критических нарушений не выявлено</div>
-</div>""", unsafe_allow_html=True)
-
-
-def render_checklist(script_details: list[str]) -> None:
-    items_html = []
-    for item in script_details:
-        label, _, val = item.rpartition(":")
-        ok = val.strip().lower().startswith("да")
-        css = "ok" if ok else "fail"
-        icon = "✅" if ok else "❌"
-        # Убираем лишнее в конце (уточнение в скобках оставляем)
-        items_html.append(
-            f'<div class="checklist-item {css}">'
-            f'<span class="checklist-icon">{icon}</span>{label.strip()}'
-            f"</div>"
-        )
-    st.markdown("\n".join(items_html), unsafe_allow_html=True)
-
-
-def render_feedback(positives: list[str], negatives: list[str]) -> None:
-    c1, c2 = st.columns(2)
-    with c1:
-        st.markdown('<div class="section-title">💪 Сильные стороны</div>', unsafe_allow_html=True)
-        if positives:
-            for item in positives[:5]:
-                st.markdown(f'<div class="feedback-item pos">✦ {item}</div>',
-                            unsafe_allow_html=True)
-        else:
-            st.markdown('<div class="feedback-item pos">Нарушений не выявлено</div>',
-                        unsafe_allow_html=True)
-    with c2:
-        st.markdown('<div class="section-title">⚠️ Замечания</div>', unsafe_allow_html=True)
-        if negatives:
-            for item in negatives[:5]:
-                st.markdown(f'<div class="feedback-item neg">→ {item}</div>',
-                            unsafe_allow_html=True)
-        else:
-            st.markdown('<div class="feedback-item neg" style="background:#f0fdf4;'
-                        'border-color:#22c55e;color:#166534;">Замечаний нет</div>',
-                        unsafe_allow_html=True)
-
-
-def render_transcript(role_text: str) -> None:
-    if not role_text or role_text.strip() == "—":
-        st.info("Транскрипт не сформирован.")
-        return
-    lines_html: list[str] = []
-    for raw_line in role_text.splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-        if line.startswith("Оператор:"):
-            text = line[len("Оператор:"):].strip()
-            lines_html.append(
-                '<div class="tx-line">'
-                '<span class="tx-badge op">Оператор</span>'
-                f'<span class="tx-text">{_esc(text)}</span>'
-                "</div>"
-            )
-        elif line.startswith("Заявитель:"):
-            text = line[len("Заявитель:"):].strip()
-            lines_html.append(
-                '<div class="tx-line">'
-                '<span class="tx-badge ap">Заявитель</span>'
-                f'<span class="tx-text">{_esc(text)}</span>'
-                "</div>"
-            )
-        else:
-            lines_html.append(
-                f'<div class="tx-line"><span class="tx-text" style="color:#9ca3af;">'
-                f"{_esc(line)}</span></div>"
-            )
-    st.markdown(
-        '<div class="transcript-wrap">' + "\n".join(lines_html) + "</div>",
-        unsafe_allow_html=True,
-    )
-
-
-def _esc(text: str) -> str:
-    return (
-        text.replace("&", "&amp;")
-            .replace("<", "&lt;")
-            .replace(">", "&gt;")
-            .replace('"', "&quot;")
-    )
-
-
-# ── Steps ─────────────────────────────────────────────────────────────────────
-
-_STEPS = [
-    ("Загрузка модели", "🧠"),
-    ("Распознавание речи", "🎙️"),
-    ("Разделение ролей", "👥"),
-    ("AI-обработка", "✨"),
-    ("Оценка качества", "📊"),
-]
-
-
-def _make_steps_html(active_idx: int, done_up_to: int) -> str:
-    parts = []
-    for i, (label, _icon) in enumerate(_STEPS):
-        if i < done_up_to:
-            dot_cls, lbl_cls, symbol = "done", "done", "✓"
-        elif i == active_idx:
-            dot_cls, lbl_cls, symbol = "active", "active", str(i + 1)
-        else:
-            dot_cls, lbl_cls, symbol = "idle", "idle", str(i + 1)
-        parts.append(
-            f'<div class="step">'
-            f'<div class="step-dot {dot_cls}">{symbol}</div>'
-            f'<div class="step-label {lbl_cls}">{label}</div>'
-            f"</div>"
-        )
-    return '<div class="steps-bar">' + "".join(parts) + "</div>"
-
-
-# ── Misc helpers ──────────────────────────────────────────────────────────────
-
-def requires_manual_review(
-    evaluation: QualityEvaluation, tone_summary: str
-) -> tuple[bool, list[str]]:
-    reasons: list[str] = []
-    if not evaluation.operator_in_staff:
-        reasons.append("оператор не найден в штатном списке")
-    if evaluation.total_score <= 4:
-        reasons.append("низкий итоговый балл")
-    if evaluation.consultation_score <= 4:
-        reasons.append("слабая консультация")
-    if evaluation.script_score <= 4:
-        reasons.append("серьёзные нарушения скрипта")
-    if "напряж" in tone_summary.lower():
-        reasons.append("напряжённый тон разговора")
-    return bool(reasons), reasons
-
-
-def _format_eta(seconds: float) -> str:
-    sec = max(0, int(seconds))
-    minutes, rem = divmod(sec, 60)
-    if minutes > 0:
-        return f"{minutes} мин {rem} сек"
-    return f"{rem} сек"
-
-
-@dataclass
-class TranscriptionProgressState:
-    """Прогресс одного файла (шаги + полоса), синхронно с логами транскрибера."""
-
-    current_step: int = 0
-    done_steps: int = 0
-    current_progress: int = 0
-
-
-def _update_transcription_progress_from_log(
-    message: str, state: TranscriptionProgressState
-) -> tuple[str | None, bool]:
-    """
-    Обновляет state по строке лога.
-    Возвращает (текст для st.progress или None, обновлять ли полосу шагов).
-
-    Логи транскрибера: ``[transcriber] [этап: имя] сообщение`` (см. transcription.Transcriber._stage).
-    """
-    m = (message or "").lower()
-
-    # Старт пайплайна — даём ненулевой %, чтобы таймер ETA мог экстраполировать
-    if "[этап: начало]" in m:
-        state.current_progress = max(state.current_progress, 4)
-        return "Открываю файл и запускаю пайплайн...", False
-    if "[этап: asr-параметры]" in m:
-        state.current_progress = max(state.current_progress, 6)
-        return "Параметры распознавания...", False
-    if "[этап: asr-модель]" in m and "загрузка" in m:
-        state.current_step, state.done_steps, state.current_progress = 0, 0, 12
-        return "Загрузка модели Whisper (может быть долго при первом запуске)...", True
-    if "[этап: asr-модель]" in m and ("готова" in m or "уже в памяти" in m):
-        state.current_step, state.done_steps, state.current_progress = 1, 1, 28
-        return "Модель готова", True
-    if "[этап: пропуск ожидания]" in m or "[этап: аудио]" in m:
-        state.current_progress = max(state.current_progress, 18)
-        return "Подготовка аудио (обрезка, нормализация)...", False
-    if "[этап: whisper]" in m and "запуск" in m:
-        state.current_step, state.done_steps, state.current_progress = 1, 1, 38
-        return "Whisper: признаки и VAD...", True
-    if "[этап: whisper]" in m and "декодирование сегментов" in m:
-        state.current_step, state.done_steps, state.current_progress = 1, 1, 52
-        return "Распознавание речи (декодирование)...", True
-    if "asr прогресс:" in m:
-        state.current_progress = min(84, max(state.current_progress, 52) + 3)
-        return "Распознавание речи...", False
-    if "распознавание завершено" in m:
-        state.current_step, state.done_steps, state.current_progress = 1, 2, 86
-        return "Распознавание завершено", True
-    if "[этап: роли]" in m and "черновик" in m:
-        state.current_step, state.done_steps = 2, 2
-        state.current_progress = max(state.current_progress, 87)
-        return "Определяю роли (черновик по тексту)...", True
-    if (
-        ("[этап: роли/" in m or "[этап: роли/ecapa" in m)
-        and "ошибка" not in m
-    ):
-        state.current_step, state.done_steps = 2, 2
-        state.current_progress = max(state.current_progress, 88)
-        return "Разделение ролей (голос / диаризация)...", True
-    if "[этап: роли+голос]" in m and "совмещение" in m:
-        state.current_step, state.done_steps = 2, 2
-        state.current_progress = max(state.current_progress, 89)
-        return "Совмещение голоса и текста...", True
-    if "[этап: роли+голос]" in m and "блок завершён" in m:
-        state.current_step, state.done_steps, state.current_progress = 3, 3, 91
-        return "Роли определены", True
-    if "[этап: llm]" in m or (
-        "[этап: llm-постредактор]" in m and "выключен" not in m and "не сработал" not in m
-    ):
-        state.current_step = 3
-        state.current_progress = max(state.current_progress, 92)
-        return "AI: пост-редактура транскрипта...", True
-    if "llm пост-редактор (" in m:
-        state.current_step = 3
-        state.current_progress = max(state.current_progress, 93)
-        return "AI: пост-редактура...", False
-    if "[этап: локальный пост]" in m and "выключен" not in m and "пропуск" not in m:
-        state.current_step = 3
-        state.current_progress = max(state.current_progress, 93)
-        return "Локальная пунктуация и роли...", True
-    if "[этап: сборка отчёта]" in m:
-        state.current_progress = max(state.current_progress, 94)
-        return "Сборка расшифровки по ролям...", False
-    if "текст собран" in m:
-        state.current_progress = max(state.current_progress, 95)
-        return "Текст и роли собраны", False
-    if "сформирована расшифровка по ролям" in m:
-        state.current_step, state.done_steps = 3, 3
-        state.current_progress = max(state.current_progress, 96)
-        return "Транскрипт по ролям готов", True
-    if "[этап: тональность]" in m and "анализ" in m:
-        state.current_progress = max(state.current_progress, 97)
-        return "Анализ тональности...", False
-    if "[этап: готово]" in m:
-        state.current_progress = max(state.current_progress, 98)
-        return "Завершение распознавания...", False
-    if "[evaluator] оцениваю" in m:
-        state.current_step, state.done_steps, state.current_progress = 4, 4, 96
-        return "Оцениваю качество консультации...", True
-    if "[evaluator] оценка готова" in m:
-        state.current_step, state.done_steps, state.current_progress = 4, 5, 99
-        return "Формирую отчёт...", True
-    return None, False
-
-
-class StreamlitLogger:
-    def __init__(self, on_log: Callable[[str], None] | None = None) -> None:
-        self.lines: list[str] = []
-        self.on_log = on_log
-
-    def __call__(self, message: str) -> None:
-        self.lines.append(message)
-        if self.on_log is not None:
-            self.on_log(message)
-
-
 class UserStopRequested(Exception):
     pass
 
@@ -894,7 +376,15 @@ class UserStopRequested(Exception):
 # ── Core logic ────────────────────────────────────────────────────────────────
 
 @st.cache_resource(show_spinner=False, scope="session")
-def get_cached_transcriber_for_gui(
+def get_cached_transcriber_for_gui(settings: TranscriberSettings) -> Transcriber:
+    """
+    Один экземпляр Transcriber + Whisper на комбинацию настроек сайдбара.
+    skip_first_seconds выставляется перед каждым transcribe() (не входит в ключ кеша).
+    """
+    return create_transcriber(settings)
+
+
+def _build_gui_transcriber_settings(
     model_name: str,
     compute_type: str,
     asr_profile: str,
@@ -903,20 +393,14 @@ def get_cached_transcriber_for_gui(
     enable_post_edit: bool,
     post_edit_timeout_seconds: int,
     enable_llm_post_edit: bool,
-    llm_yandex_api_key: str,
-    llm_yandex_folder_id: str,
+    llm_yandex_api_key: str | None,
+    llm_yandex_folder_id: str | None,
     llm_yandex_model: str,
     llm_yandex_timeout: float,
-) -> Transcriber:
-    """
-    Один экземпляр Transcriber + Whisper на комбинацию настроек сайдбара.
-    skip_first_seconds выставляется перед каждым transcribe() (не входит в ключ кеша).
-    """
-    return Transcriber(
+) -> TranscriberSettings:
+    return TranscriberSettings(
         model_name=model_name,
         compute_type=compute_type,
-        skip_first_seconds=None,
-        language="ru",
         asr_profile=asr_profile,
         heavy_diarization=heavy_diarization,
         heavy_diarization_timeout_seconds=heavy_diarization_timeout_seconds,
@@ -924,216 +408,11 @@ def get_cached_transcriber_for_gui(
         post_edit_timeout_seconds=post_edit_timeout_seconds,
         enable_llm_post_edit=enable_llm_post_edit,
         llm_backend="yandex" if enable_llm_post_edit else "off",
-        llm_yandex_api_key=llm_yandex_api_key or None,
-        llm_yandex_folder_id=llm_yandex_folder_id or None,
+        llm_yandex_api_key=llm_yandex_api_key,
+        llm_yandex_folder_id=llm_yandex_folder_id,
         llm_yandex_model=llm_yandex_model,
         llm_post_edit_timeout_seconds=float(llm_yandex_timeout),
     )
-
-
-def run_analysis(
-    audio_path: str,
-    model_name: str,
-    compute_type: str,
-    asr_profile: str,
-    heavy_diarization: bool,
-    heavy_diarization_timeout_seconds: int,
-    enable_post_edit: bool,
-    post_edit_timeout_seconds: int,
-    operator_name: str | None,
-    original_basename: str | None = None,
-    skip_first_seconds: float | None = None,
-    on_log: Callable[[str], None] | None = None,
-    *,
-    enable_llm_post_edit: bool = False,
-    llm_yandex_api_key: str | None = None,
-    llm_yandex_folder_id: str | None = None,
-    llm_yandex_model: str = "yandexgpt-lite",
-    llm_yandex_timeout: float = 60.0,
-    cloud_eval_cfg=None,
-) -> tuple[str, TranscriptionResult, QualityEvaluation, str]:
-    logger = StreamlitLogger(on_log=on_log)
-    transcriber = get_cached_transcriber_for_gui(
-        model_name,
-        compute_type,
-        asr_profile,
-        heavy_diarization,
-        heavy_diarization_timeout_seconds,
-        enable_post_edit,
-        post_edit_timeout_seconds,
-        enable_llm_post_edit,
-        llm_yandex_api_key or "",
-        llm_yandex_folder_id or "",
-        llm_yandex_model,
-        float(llm_yandex_timeout),
-    )
-    transcriber.skip_first_seconds = skip_first_seconds
-    transcriber._log = logger  # type: ignore[method-assign]
-
-    result = transcriber.transcribe(audio_path, original_basename=original_basename)
-    logger("[evaluator] Оцениваю качество консультации...")
-    if cloud_eval_cfg is not None:
-        from llm_cloud_eval import run_cloud_evaluation
-
-        evaluation, cloud_status = run_cloud_evaluation(
-            result.text,
-            result.role_text,
-            cloud_eval_cfg,
-            forced_operator_name=operator_name,
-            log=logger,
-        )
-        logger(f"[evaluator] Оценка готова ({cloud_status}).")
-    else:
-        evaluator = CallQualityEvaluator()
-        evaluation = evaluator.evaluate(
-            result.text,
-            result.role_text,
-            forced_operator_name=operator_name,
-        )
-        logger("[evaluator] Оценка готова.")
-    report = build_report(result, evaluation)
-    return "\n".join(logger.lines), result, evaluation, report
-
-
-# ── Sidebar ───────────────────────────────────────────────────────────────────
-
-def render_sidebar() -> tuple[bool, object | None]:
-    """Рисует сайдбар и возвращает (use_yandex, cloud_eval_cfg)."""
-    with st.sidebar:
-        st.markdown(f"""
-<div class="sidebar-logo">
-  <div class="sidebar-logo-icon">📞</div>
-  <div>
-    <div class="sidebar-logo-text">Анализ звонков</div>
-    <div class="sidebar-logo-sub">ДВФУ · ЕКЦ</div>
-    <div class="sidebar-logo-version">{APP_VERSION_LABEL} · {APP_VERSION_DATE}</div>
-  </div>
-</div>""", unsafe_allow_html=True)
-
-        env_api_key = os.environ.get("YANDEX_API_KEY", "").strip()
-        env_folder_id = os.environ.get("YANDEX_FOLDER_ID", "").strip()
-        env_keys_set = bool(env_api_key and env_folder_id)
-
-        st.markdown("**Яндекс AI Studio**")
-        use_yandex = st.toggle(
-            "Включить AI-анализ",
-            value=env_keys_set,
-            help="Включает облачную оценку и исправление транскрипта через Яндекс AI.",
-        )
-
-        cloud_eval_cfg = None
-        yandex_api_key = env_api_key
-        yandex_folder_id = env_folder_id
-        _YANDEX_MODEL_ORDER = ("yandexgpt-lite", "yandexgpt/latest")
-        _YANDEX_MODEL_LABELS = {
-            "yandexgpt-lite": "YandexGPT Lite (по умолчанию)",
-            "yandexgpt/latest": "YandexGPT Pro",
-        }
-        # При выключенном AI значение не используется для запросов
-        yandex_model_key = "yandexgpt-lite"
-        yandex_timeout = int(float(os.environ.get("YANDEX_CLOUD_TIMEOUT_SECONDS", "60")))
-
-        if use_yandex:
-            if env_keys_set:
-                st.markdown(
-                    '<div class="ai-connected">🟢 Подключено — ключи заданы (см. Админ-панель для смены)</div>',
-                    unsafe_allow_html=True,
-                )
-            else:
-                st.markdown(
-                    '<div class="ai-disconnected">🟡 Ключи не заданы — укажите API Key и Folder ID в «Админ-панели» ниже</div>',
-                    unsafe_allow_html=True,
-                )
-
-            # Lite / Pro
-            if "yandex_cloud_model_lp" not in st.session_state:
-                st.session_state["yandex_cloud_model_lp"] = "yandexgpt-lite"
-            yandex_model_key = st.radio(
-                "Модель",
-                options=list(_YANDEX_MODEL_ORDER),
-                format_func=lambda k: _YANDEX_MODEL_LABELS[k],
-                horizontal=True,
-                key="yandex_cloud_model_lp",
-                help="Тот же API-ключ Yandex AI Studio. Lite — быстрее; Pro — точнее.",
-            )
-
-            with st.expander("Дополнительно", expanded=False):
-                yandex_timeout = st.slider(
-                    "Таймаут запроса (сек)",
-                    min_value=15, max_value=300, value=yandex_timeout, step=5,
-                    help="Для длинных звонков при необходимости увеличьте (до 120 с и выше).",
-                )
-
-            if yandex_api_key.strip() and yandex_folder_id.strip():
-                from llm_cloud_eval import YandexCloudConfig
-
-                cloud_eval_cfg = YandexCloudConfig(
-                    api_key=yandex_api_key.strip(),
-                    folder_id=yandex_folder_id.strip(),
-                    model=yandex_model_key,
-                    timeout_seconds=float(yandex_timeout),
-                )
-            else:
-                st.warning("Укажите API Key и Folder ID в разделе «Админ-панель» ниже.")
-        else:
-            st.markdown(
-                '<div class="ai-disconnected">⚪ AI отключён — только локальная эвристика</div>',
-                unsafe_allow_html=True,
-            )
-
-        st.divider()
-        st.markdown("**Распознавание речи**")
-        quality = st.radio(
-            "Качество",
-            # Первый пункт — значение по умолчанию (Ultima)
-            options=["ultima", "max", "standard"],
-            format_func=lambda x: {
-                "max": "🎯 Максимум (~12–22 мин)",
-                "standard": "⚡ Стандарт (~1–3 мин)",
-                "ultima": "🔮 Ultima (~7–12 мин, RU Large-v3)",
-            }[x],
-            horizontal=True,
-            help=(
-                "Стандарт: Whisper Medium, int8; быстро, достаточно для большинства звонков. "
-                "Максимум: Systran Large-v3 + beam 9/best_of 5 + 3 температуры; максимальное качество. "
-                "Ultima: fine-tuned whisper-large-v3-russian; beam 9/best_of 4/patience 1.1 + 3 температуры; "
-                "спектральный денойз (SNR↑ для тихой/шумной речи); "
-                "сверхчувствительный VAD pad=2000ms (не режет первые слова); "
-                "no_speech_threshold=0.82, log_prob=-1.2 (декодирует даже тихие вступления); "
-                "плотная диаризация: окна 2.4с/шаг 0.6с, взвешенный vote. На Mac без GPU — int8_float32."
-            ),
-        )
-        if quality == "standard":
-            model_name, compute_type, asr_profile, heavy_mode = "medium", "int8", "medium_ru", False
-        elif quality == "ultima":
-            model_name, compute_type, asr_profile, heavy_mode = (
-                resolve_ultima_whisper_model(),
-                "int8_float32",
-                "ultima_ru",
-                True,
-            )
-        else:
-            model_name, compute_type, asr_profile, heavy_mode = "large-v3", "int8_float32", "ideal_ru", True
-
-        with st.expander("Тонкая настройка", expanded=False):
-            heavy_timeout = st.slider(
-                "Таймаут диаризации (сек)",
-                min_value=90, max_value=300, value=150, step=10,
-            )
-            enable_post_edit = st.checkbox(
-                "Локальный пунктуатор",
-                value=False,
-                help="Расставляет знаки препинания без интернета. Обычно не нужен с Яндекс AI.",
-            )
-
-        render_admin_panel_sidebar()
-
-    return (
-        use_yandex, cloud_eval_cfg,
-        model_name, compute_type, asr_profile, heavy_mode,
-        heavy_timeout, enable_post_edit,
-    )
-
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
@@ -1167,13 +446,11 @@ def main() -> None:
 
     render_header()
 
-    (
-        use_yandex, cloud_eval_cfg,
-        model_name, compute_type, asr_profile, heavy_mode,
-        heavy_timeout, enable_post_edit,
-    ) = render_sidebar()
+    sidebar_state = render_sidebar(APP_VERSION_LABEL, APP_VERSION_DATE)
 
-    cloud_mode_active = use_yandex and cloud_eval_cfg is not None
+    cloud_mode_active = (
+        sidebar_state.use_yandex and sidebar_state.cloud_eval_cfg is not None
+    )
     enable_llm_post_edit = cloud_mode_active
 
     def parse_diag_pairs(diag: str) -> dict[str, str]:
@@ -1211,13 +488,13 @@ def main() -> None:
 
     with tab_batch:
         render_batch_tab(
-            model_name=model_name,
-            compute_type=compute_type,
-            asr_profile=asr_profile,
-            heavy_mode=heavy_mode,
-            heavy_timeout=heavy_timeout,
-            enable_post_edit=enable_post_edit,
-            cloud_eval_cfg=cloud_eval_cfg,
+            model_name=sidebar_state.model_name,
+            compute_type=sidebar_state.compute_type,
+            asr_profile=sidebar_state.asr_profile,
+            heavy_mode=sidebar_state.heavy_mode,
+            heavy_timeout=sidebar_state.heavy_timeout,
+            enable_post_edit=sidebar_state.enable_post_edit,
+            cloud_eval_cfg=sidebar_state.cloud_eval_cfg,
             cloud_mode_active=cloud_mode_active,
         )
 
@@ -1226,14 +503,14 @@ def main() -> None:
             operator_options=operator_options,
             operator_option_to_name=operator_option_to_name,
             parse_diag_pairs=parse_diag_pairs,
-            model_name=model_name,
-            compute_type=compute_type,
-            asr_profile=asr_profile,
-            heavy_mode=heavy_mode,
-            heavy_timeout=heavy_timeout,
-            enable_post_edit=enable_post_edit,
+            model_name=sidebar_state.model_name,
+            compute_type=sidebar_state.compute_type,
+            asr_profile=sidebar_state.asr_profile,
+            heavy_mode=sidebar_state.heavy_mode,
+            heavy_timeout=sidebar_state.heavy_timeout,
+            enable_post_edit=sidebar_state.enable_post_edit,
             cloud_mode_active=cloud_mode_active,
-            cloud_eval_cfg=cloud_eval_cfg,
+            cloud_eval_cfg=sidebar_state.cloud_eval_cfg,
             enable_llm_post_edit=enable_llm_post_edit,
         )
 # ── Single file tab ───────────────────────────────────────────────────────────
@@ -1376,7 +653,7 @@ def _render_single_tab(
 
     # ── Прогресс ────────────────────────────────────────────────────────────
     steps_placeholder = st.empty()
-    steps_placeholder.markdown(_make_steps_html(-1, 0), unsafe_allow_html=True)
+    steps_placeholder.markdown(make_steps_html(-1, 0), unsafe_allow_html=True)
 
     progress = st.progress(0, text="Подготовка...")
     eta_placeholder = st.empty()
@@ -1393,11 +670,11 @@ def _render_single_tab(
             raise UserStopRequested("Анализ остановлен пользователем.")
         ui_logs.append(message)
         live_logs_placeholder.code("\n".join(ui_logs[-20:]) or "")
-        bar_text, update_steps = _update_transcription_progress_from_log(message, progress_state)
+        bar_text, update_steps = update_transcription_progress_from_log(message, progress_state)
         if bar_text is not None:
             if update_steps:
                 steps_placeholder.markdown(
-                    _make_steps_html(progress_state.current_step, progress_state.done_steps),
+                    make_steps_html(progress_state.current_step, progress_state.done_steps),
                     unsafe_allow_html=True,
                 )
             progress.progress(progress_state.current_progress, text=bar_text)
@@ -1424,21 +701,21 @@ def _render_single_tab(
             pct = progress_state.current_progress
             if pct <= 0:
                 eta_placeholder.caption(
-                    f"⏱ Прошло: **{_format_eta(elapsed)}** · "
+                    f"⏱ Прошло: **{format_eta(elapsed)}** · "
                     "ожидание первых этапов лога (долгая загрузка модели — норма)…"
                 )
             elif pct < 6:
                 # При 1–5% линейная экстраполяция даёт огромный «остаток»
                 eta_placeholder.caption(
-                    f"⏱ Прошло: **{_format_eta(elapsed)}** · "
+                    f"⏱ Прошло: **{format_eta(elapsed)}** · "
                     "осталось: **уточняется…** (ранняя стадия)"
                 )
             else:
                 remaining = elapsed * (100 - pct) / max(pct, 1)
                 remaining = min(remaining, 3_600.0)  # не показываем > 1 ч от одной экстраполяции
                 eta_placeholder.caption(
-                    f"⏱ Прошло: **{_format_eta(elapsed)}** · "
-                    f"осталось примерно: **{_format_eta(remaining)}**"
+                    f"⏱ Прошло: **{format_eta(elapsed)}** · "
+                    f"осталось примерно: **{format_eta(remaining)}**"
                 )
 
     _timer_thread = threading.Thread(target=_eta_timer_loop, daemon=True, name="eta_timer")
@@ -1460,8 +737,7 @@ def _render_single_tab(
                     if _skip_total > 0:
                         skip_from_manual = float(_skip_total)
 
-                logs, result, evaluation, report = run_analysis(
-                    audio_path=str(tmp_path),
+                transcriber_settings = _build_gui_transcriber_settings(
                     model_name=model_name,
                     compute_type=compute_type,
                     asr_profile=asr_profile,
@@ -1469,17 +745,26 @@ def _render_single_tab(
                     heavy_diarization_timeout_seconds=heavy_timeout,
                     enable_post_edit=enable_post_edit,
                     post_edit_timeout_seconds=60,
-                    operator_name=operator_name,
-                    original_basename=uploaded_file.name,
-                    skip_first_seconds=skip_from_manual,
-                    on_log=update_live_log,
                     enable_llm_post_edit=enable_llm_post_edit,
                     llm_yandex_api_key=cloud_eval_cfg.api_key if cloud_eval_cfg else None,
                     llm_yandex_folder_id=cloud_eval_cfg.folder_id if cloud_eval_cfg else None,
                     llm_yandex_model=cloud_eval_cfg.model if cloud_eval_cfg else "yandexgpt-lite",
                     llm_yandex_timeout=cloud_eval_cfg.timeout_seconds if cloud_eval_cfg else 60.0,
-                    cloud_eval_cfg=cloud_eval_cfg,
                 )
+                analysis = analyze_call(
+                    AnalysisRequest(
+                        audio_path=str(tmp_path),
+                        operator_name=operator_name,
+                        original_basename=uploaded_file.name,
+                        skip_first_seconds=skip_from_manual,
+                        cloud_eval_cfg=cloud_eval_cfg,
+                    ),
+                    transcriber=get_cached_transcriber_for_gui(transcriber_settings),
+                    on_log=update_live_log,
+                )
+                result = analysis.result
+                evaluation = analysis.evaluation
+                report = analysis.report
             except UserStopRequested as exc:
                 progress.progress(100, text="Остановлено")
                 eta_placeholder.empty()
@@ -1500,27 +785,18 @@ def _render_single_tab(
 
     progress.progress(100, text="Готово!")
     eta_placeholder.empty()
-    steps_placeholder.markdown(_make_steps_html(-1, 5), unsafe_allow_html=True)
+    steps_placeholder.markdown(make_steps_html(-1, 5), unsafe_allow_html=True)
     progress.empty()
 
     # Экспорт в Google Таблицу (полный набор колонок)
     try:
         if is_sheets_configured():
             ok, msg = append_analysis_row(
-                original_filename=uploaded_file.name,
-                total_score=evaluation.total_score,
-                max_score=evaluation.max_score,
-                operator_name=evaluation.operator_name,
-                applicant_name=evaluation.applicant_name or "",
-                script_score=evaluation.script_score,
-                speech_score=evaluation.speech_score,
-                consultation_score=evaluation.consultation_score,
-                engagement_score=evaluation.engagement_score,
-                tone_summary=result.tone_summary,
-                script_details=evaluation.script_details,
-                positives=evaluation.positives,
-                negatives=evaluation.negatives,
-                filename_meta_override=filename_meta_override,
+                **build_sheets_export_payload(
+                    analysis,
+                    original_filename=uploaded_file.name,
+                    filename_meta_override=filename_meta_override,
+                )
             )
             if ok:
                 st.success(f"Google Таблица: {msg}")
@@ -1610,117 +886,6 @@ def _render_single_tab(
         if result.role_diagnostics:
             st.code(result.role_diagnostics, language=None)
 
-
-# ── Batch processing ──────────────────────────────────────────────────────────
-
-def _result_to_row_dict(
-    filename: str,
-    result: TranscriptionResult,
-    evaluation: QualityEvaluation,
-) -> dict:
-    """Конвертирует результат одного файла в dict для sheets_export / pandas."""
-    from sheets_export import parse_call_filename_metadata, needs_review
-    meta = parse_call_filename_metadata(filename)
-    return {
-        "original_filename": filename,
-        "date": meta["date"] or "—",
-        "operator_name": evaluation.operator_name or "—",
-        "phone": meta["phone"] or "—",
-        "applicant_name": evaluation.applicant_name or "—",
-        "wait_display": meta["wait_display"] or "—",
-        "total_score": evaluation.total_score,
-        "max_score": evaluation.max_score,
-        "script_score": evaluation.script_score,
-        "speech_score": evaluation.speech_score,
-        "consultation_score": evaluation.consultation_score,
-        "engagement_score": evaluation.engagement_score,
-        "tone_summary": result.tone_summary or "—",
-        "script_details": evaluation.script_details,
-        "positives": evaluation.positives,
-        "negatives": evaluation.negatives,
-        "review_flag": needs_review(evaluation.total_score, evaluation.negatives),
-    }
-
-
-def _render_live_batch_table(
-    placeholder,
-    collected: list[dict],
-    errors: dict[str, str],
-    sheets_log: dict[str, str],
-    sheets_configured: bool,
-) -> None:
-    """Обновляет живую таблицу результатов прямо во время обработки."""
-    if not collected and not errors:
-        return
-    try:
-        import pandas as pd
-
-        rows = []
-        for i, r in enumerate(collected):
-            row = {
-                "№": i + 1,
-                "Файл": r["original_filename"],
-                "Дата": r["date"],
-                "Оператор": r["operator_name"],
-                "Заявитель": r["applicant_name"],
-                "Итог": r["total_score"],
-                "Прослушать": r["review_flag"],
-            }
-            if sheets_configured:
-                row["Таблица"] = sheets_log.get(r["original_filename"], "⏳")
-            rows.append(row)
-
-        for fname, emsg in errors.items():
-            row = {
-                "№": "—",
-                "Файл": fname,
-                "Дата": "—",
-                "Оператор": "—",
-                "Заявитель": "—",
-                "Итог": "❌",
-                "Прослушать": emsg[:40],
-            }
-            if sheets_configured:
-                row["Таблица"] = "—"
-            rows.append(row)
-
-        df = pd.DataFrame(rows)
-
-        def _color_score(val):
-            try:
-                v = int(val)
-                if v >= 8:
-                    return "background-color: #dcfce7; color: #166534"
-                if v >= 5:
-                    return "background-color: #fef9c3; color: #854d0e"
-                return "background-color: #fee2e2; color: #991b1b"
-            except Exception:
-                return ""
-
-        def _color_review(val):
-            if val == "Да":
-                return "background-color: #fee2e2; color: #991b1b; font-weight:600"
-            if val == "Нет":
-                return "background-color: #dcfce7; color: #166534; font-weight:600"
-            return ""
-
-        style = df.style.applymap(_color_score, subset=["Итог"]).applymap(
-            _color_review, subset=["Прослушать"]
-        )
-        placeholder.dataframe(style, width="stretch", hide_index=True)
-    except ImportError:
-        lines = [f"{r['№']}. {r['original_filename']} — {r['total_score']}/10" for r in collected]
-        placeholder.text("\n".join(lines))
-
-
-def _format_uploaded_size(num_bytes: int) -> str:
-    if num_bytes >= 1024 * 1024:
-        return f"{num_bytes / (1024 * 1024):.1f} МБ"
-    if num_bytes >= 1024:
-        return f"{num_bytes / 1024:.1f} КБ"
-    return f"{num_bytes} Б"
-
-
 def render_batch_tab(
     model_name: str,
     compute_type: str,
@@ -1741,6 +906,84 @@ def render_batch_tab(
         "Укажите оператора: все записи в пакете считаются звонками одного оператора (автоопределения нет)."
     )
 
+    from sheets_export import (
+        CALL_FILENAME_REQUIREMENTS_RU,
+        append_analysis_row,
+        is_sheets_configured,
+        is_standard_call_filename,
+        sheets_config_hint,
+    )
+
+    resume_state = load_batch_resume_state()
+    resume_files = list(resume_state.files) if resume_state is not None else []
+    resume_next_idx = resume_state.next_idx if resume_state is not None else 0
+    resume_total = len(resume_files)
+    resume_available = bool(resume_total > 0 and 0 <= resume_next_idx < resume_total)
+
+    resume_batch = False
+    _AUTO_RESUME_WINDOW_S = 300
+    _AUTO_RESUME_COUNTDOWN_S = 15
+    if resume_available:
+        # Авто-возобновление: если пакет прервался недавно (< 5 мин), запускаем обратный отсчёт.
+        try:
+            _batch_mtime = batch_resume_state_path().stat().st_mtime
+            _recently_active = (time.time() - _batch_mtime) < _AUTO_RESUME_WINDOW_S
+        except OSError:
+            _recently_active = False
+
+        _ar_cancelled = st.session_state.get("batch_auto_resume_cancelled", False)
+
+        if _recently_active and not _ar_cancelled:
+            if "batch_auto_resume_deadline" not in st.session_state:
+                st.session_state["batch_auto_resume_deadline"] = time.time() + _AUTO_RESUME_COUNTDOWN_S
+
+            _ar_deadline = st.session_state["batch_auto_resume_deadline"]
+            _ar_remaining = max(0, int(_ar_deadline - time.time()))
+
+            if _ar_remaining <= 0:
+                st.session_state.pop("batch_auto_resume_deadline", None)
+                st.session_state.pop("batch_auto_resume_cancelled", None)
+                resume_batch = True
+            else:
+                st.warning(
+                    f"⏱ Незавершённый пакет ({resume_next_idx}/{resume_total} обработано). "
+                    f"Автоматическое продолжение через **{_ar_remaining}** сек…"
+                )
+                _ar_c1, _ar_c2 = st.columns([5, 2])
+                with _ar_c1:
+                    st.progress(
+                        1.0 - (_ar_remaining / _AUTO_RESUME_COUNTDOWN_S),
+                        text=f"{_ar_remaining} сек до автовозобновления",
+                    )
+                with _ar_c2:
+                    if st.button("❌ Отменить автовозобновление", key="batch_auto_resume_cancel_btn"):
+                        st.session_state["batch_auto_resume_cancelled"] = True
+                        st.session_state.pop("batch_auto_resume_deadline", None)
+                        st.rerun()
+                time.sleep(1)
+                st.rerun()
+
+        if not resume_batch:
+            st.info(
+                f"Найден незавершённый пакет: {resume_next_idx}/{resume_total} файлов уже обработано. "
+                "Можно продолжить с места остановки."
+            )
+            r1, r2 = st.columns([4, 1])
+            with r1:
+                resume_batch = st.button(
+                    "▶ Продолжить незавершённый пакет",
+                    type="secondary",
+                    width="stretch",
+                    key="batch_resume",
+                )
+            with r2:
+                if st.button("🗑 Сбросить", width="stretch", key="batch_resume_clear"):
+                    clear_batch_resume_state()
+                    st.session_state.pop("batch_auto_resume_deadline", None)
+                    st.session_state.pop("batch_auto_resume_cancelled", None)
+                    st.success("Незавершённый пакет удалён.")
+                    st.rerun()
+
     uploaded_files = st.file_uploader(
         "Аудиофайлы звонков",
         type=["wav", "mp3", "m4a", "ogg", "flac"],
@@ -1752,19 +995,12 @@ def render_batch_tab(
         key="batch_uploader",
     )
 
-    if not uploaded_files:
+    if not uploaded_files and not resume_batch:
         st.info("Выберите один или несколько аудиофайлов для начала.")
         return
 
-    from sheets_export import (
-        CALL_FILENAME_REQUIREMENTS_RU,
-        append_analysis_row,
-        is_sheets_configured,
-        is_standard_call_filename,
-    )
-
-    valid_batch_files = [f for f in uploaded_files if is_standard_call_filename(f.name)]
-    invalid_batch_files = [f for f in uploaded_files if not is_standard_call_filename(f.name)]
+    valid_batch_files = [f for f in (uploaded_files or []) if is_standard_call_filename(f.name)]
+    invalid_batch_files = [f for f in (uploaded_files or []) if not is_standard_call_filename(f.name)]
 
     for bad in invalid_batch_files:
         st.error(
@@ -1774,34 +1010,40 @@ def render_batch_tab(
         with st.expander("Требования к имени файла (пакетная обработка)", expanded=True):
             st.markdown(CALL_FILENAME_REQUIREMENTS_RU)
 
-    if not valid_batch_files:
+    if not valid_batch_files and not resume_batch:
         st.warning(
             "Нет файлов с корректными именами. Переименуйте записи по шаблону выше или загрузите другие файлы."
         )
         return
 
-    st.markdown(
-        f"**К обработке: {len(valid_batch_files)}** из {len(uploaded_files)} "
-        f"(отклонено по имени: {len(invalid_batch_files)})."
-    )
-    with st.expander(
-        f"📋 Файлы в пакете ({len(valid_batch_files)})",
-        expanded=True,
-    ):
-        for i, uf in enumerate(valid_batch_files, 1):
-            st.markdown(f"{i}. `{uf.name}` — {_format_uploaded_size(uf.size)}")
+    if valid_batch_files:
+        st.markdown(
+            f"**К обработке: {len(valid_batch_files)}** из {len(uploaded_files)} "
+            f"(отклонено по имени: {len(invalid_batch_files)})."
+        )
+        with st.expander(
+            f"📋 Файлы в пакете ({len(valid_batch_files)})",
+            expanded=True,
+        ):
+            for i, uf in enumerate(valid_batch_files, 1):
+                st.markdown(f"{i}. `{uf.name}` — {format_uploaded_size(uf.size)}")
 
     _BATCH_OP_PLACEHOLDER = "— Выберите оператора —"
-    batch_operator_pick = st.selectbox(
-        "Оператор для всего пакета (обязательно)",
-        options=[_BATCH_OP_PLACEHOLDER] + list(OPERATOR_CANONICAL_NAMES),
-        index=0,
-        help="Все файлы в пакете будут проанализированы как звонки этого оператора. Автоопределение в пакете отключено.",
-        key="batch_operator_select",
-    )
-    batch_operator_resolved: str | None = (
-        None if batch_operator_pick == _BATCH_OP_PLACEHOLDER else batch_operator_pick
-    )
+    if resume_batch and resume_state is not None:
+        _saved_op = resume_state.operator_name.strip()
+        batch_operator_resolved: str | None = _saved_op or None
+        st.caption(f"Режим возобновления: оператор пакета — `{batch_operator_resolved or 'Не указан'}`")
+    else:
+        batch_operator_pick = st.selectbox(
+            "Оператор для всего пакета (обязательно)",
+            options=[_BATCH_OP_PLACEHOLDER] + list(OPERATOR_CANONICAL_NAMES),
+            index=0,
+            help="Все файлы в пакете будут проанализированы как звонки этого оператора. Автоопределение в пакете отключено.",
+            key="batch_operator_select",
+        )
+        batch_operator_resolved = (
+            None if batch_operator_pick == _BATCH_OP_PLACEHOLDER else batch_operator_pick
+        )
 
     if "batch_results" not in st.session_state:
         st.session_state["batch_results"] = []
@@ -1818,7 +1060,7 @@ def render_batch_tab(
             key="batch_start",
             disabled=not _can_start_batch,
         )
-    if valid_batch_files and batch_operator_resolved is None:
+    if valid_batch_files and batch_operator_resolved is None and not resume_batch:
         st.warning("Выберите оператора из списка, чтобы запустить пакетный анализ.")
     with btn_col2:
         if st.button("🗑 Очистить", width="stretch", key="batch_clear"):
@@ -1828,14 +1070,101 @@ def render_batch_tab(
 
     sheets_configured = is_sheets_configured()
 
-    if start_batch:
-        st.session_state["batch_results"] = []
-        st.session_state["batch_errors"] = {}
-        st.session_state["batch_sheets_log"] = {}
+    if cloud_mode_active and cloud_eval_cfg is not None:
+        st.text_area(
+            "Доп. комментарии для нейросети (оценка звонка)",
+            height=100,
+            key="batch_eval_extra_instructions",
+            placeholder=(
+                "Например: пакет по льготам — в positives отмечай, если оператор перечислил документы; "
+                "строже к срокам ответа…"
+            ),
+            help=(
+                "Текст добавляется к системному промпту **облачной оценки** (Yandex) для **каждого** файла "
+                "в пакете. Не меняет распознавание речи. При «Продолжить незавершённый пакет» "
+                "используются инструкции, сохранённые при старте пакета."
+            ),
+        )
+
+    if start_batch or resume_batch:
+        st.session_state.pop("batch_auto_resume_deadline", None)
+        st.session_state.pop("batch_auto_resume_cancelled", None)
+        if start_batch:
+            st.session_state["batch_results"] = []
+            st.session_state["batch_errors"] = {}
+            st.session_state["batch_sheets_log"] = {}
+
+        # Список файлов для обработки:
+        # - новый запуск: сохраняем upload-байты на диск и пишем checkpoint
+        # - resume: читаем сохранённое состояние и продолжаем с next_idx
+        file_jobs: list[BatchFileJob] = []
+        start_idx = 0
+        collected: list[dict] = []
+        errors: dict[str, str] = {}
+        sheets_log: dict[str, str] = {}
+
+        if resume_batch and resume_state is not None:
+            raw_jobs = resume_state.files
+            if not raw_jobs:
+                st.error("Незавершённый пакет повреждён: список файлов пуст.")
+                clear_batch_resume_state()
+                return
+            file_jobs = list(raw_jobs)
+            start_idx = resume_state.next_idx
+            collected = list(resume_state.collected)
+            errors = dict(resume_state.errors)
+            sheets_log = dict(resume_state.sheets_log)
+            if start_idx >= len(file_jobs):
+                st.info("Незавершённых файлов не осталось.")
+                clear_batch_resume_state()
+                return
+            # Берём сохранённого оператора, чтобы не зависеть от текущего выбора в UI.
+            _saved_op = resume_state.operator_name.strip()
+            if _saved_op:
+                batch_operator_resolved = _saved_op
+            batch_cloud_eval_extra = resume_state.cloud_eval_extra.strip()
+        else:
+            # Новый запуск: сохраняем все загруженные файлы в temp-хранилище для восстановления после сброса.
+            _resume_dir = batch_resume_files_dir()
+            _resume_dir.mkdir(parents=True, exist_ok=True)
+            for old in _resume_dir.glob("*"):
+                try:
+                    old.unlink()
+                except Exception:
+                    pass
+            for idx_f, uf in enumerate(valid_batch_files, 1):
+                safe_name = re.sub(r"[^\w.\-]+", "_", uf.name, flags=re.UNICODE)
+                suffix = Path(uf.name).suffix or ".wav"
+                fp = _resume_dir / f"{idx_f:04d}_{safe_name}{'' if safe_name.endswith(suffix) else suffix}"
+                fp.write_bytes(uf.getvalue())
+                file_jobs.append(
+                    BatchFileJob(
+                        name=uf.name,
+                        path=str(fp),
+                        size=int(getattr(uf, "size", 0) or 0),
+                    )
+                )
+            batch_cloud_eval_extra = (
+                (st.session_state.get("batch_eval_extra_instructions") or "").strip()
+                if cloud_mode_active and cloud_eval_cfg is not None
+                else ""
+            )
+            save_batch_resume_state(
+                BatchResumeState(
+                    created_at=time.time(),
+                    next_idx=0,
+                    operator_name=batch_operator_resolved or "",
+                    cloud_eval_extra=batch_cloud_eval_extra,
+                    files=file_jobs,
+                    collected=[],
+                    errors={},
+                    sheets_log={},
+                )
+            )
 
         batch_timer_placeholder = st.empty()
         steps_placeholder = st.empty()
-        steps_placeholder.markdown(_make_steps_html(-1, 0), unsafe_allow_html=True)
+        steps_placeholder.markdown(make_steps_html(-1, 0), unsafe_allow_html=True)
         file_progress = st.progress(0, text="Текущий файл: ожидание…")
         progress_bar = st.progress(0, text="Пакет: подготовка…")
         status_text = st.empty()
@@ -1843,18 +1172,33 @@ def render_batch_tab(
         with st.expander("Лог текущего файла", expanded=True):
             batch_live_logs_placeholder = st.empty()
 
-        total = len(valid_batch_files)
-        collected: list[dict] = []
-        errors: dict[str, str] = {}
-        sheets_log: dict[str, str] = {}
+        total = len(file_jobs)
+        transcriber_settings = _build_gui_transcriber_settings(
+            model_name=model_name,
+            compute_type=compute_type,
+            asr_profile=asr_profile,
+            heavy_diarization=heavy_mode,
+            heavy_diarization_timeout_seconds=heavy_timeout,
+            enable_post_edit=enable_post_edit,
+            post_edit_timeout_seconds=60,
+            enable_llm_post_edit=cloud_mode_active,
+            llm_yandex_api_key=cloud_eval_cfg.api_key if cloud_eval_cfg else None,
+            llm_yandex_folder_id=cloud_eval_cfg.folder_id if cloud_eval_cfg else None,
+            llm_yandex_model=cloud_eval_cfg.model if cloud_eval_cfg else "yandexgpt-lite",
+            llm_yandex_timeout=cloud_eval_cfg.timeout_seconds if cloud_eval_cfg else 60.0,
+        )
+        cached_transcriber = get_cached_transcriber_for_gui(transcriber_settings)
+
+        if batch_cloud_eval_extra and cloud_eval_cfg is not None:
+            st.caption("📝 Для оценки в пакете учитываются **ваши доп. комментарии** (см. поле выше / чекпоинт пакета).")
 
         # ── Оценка длительности аудио по размеру файла ───────────────────────
         # Эмпирический коэффициент из замеров: 979 с аудио → 1061 с обработки
         _PROC_PER_AUDIO_S: float = 1.084  # секунд обработки на секунду аудио
 
-        def _est_audio_s(uf) -> float:
+        def _est_audio_s(job: BatchFileJob) -> float:
             """Грубая оценка длительности аудио по размеру файла и расширению."""
-            ext = Path(uf.name).suffix.lower()
+            ext = Path(job.name).suffix.lower()
             # байт в секунду для типичных форматов записей звонков
             bps = {
                 ".mp3":  8_000,   # 64 кбит/с — стандарт АТС/CRM
@@ -1865,9 +1209,10 @@ def render_batch_tab(
                 ".opus": 6_000,
                 ".flac": 32_000,
             }.get(ext, 8_000)
-            return max(1.0, uf.size / bps)
+            size = int(job.size or 0)
+            return max(1.0, size / bps)
 
-        est_audio: list[float] = [_est_audio_s(f) for f in valid_batch_files]
+        est_audio: list[float] = [_est_audio_s(f) for f in file_jobs]
 
         batch_ui: dict = {
             "batch_start": time.perf_counter(),
@@ -1878,7 +1223,7 @@ def render_batch_tab(
             "completed_durations": [],
             # фактически отработанные секунды аудио (est) — для калибровки ratio
             "completed_audio_est": [],
-            "total": len(valid_batch_files),
+            "total": len(file_jobs),
             # предрасчитанные оценки аудио для каждого файла
             "est_audio": est_audio,
             # текущий калиброванный коэффициент (обновляется после каждого файла)
@@ -1943,10 +1288,10 @@ def render_batch_tab(
                 if not comp and pct < 5 and idx == 0:
                     rest_str = "уточняется…"
                 else:
-                    rest_str = _format_eta(rem_total)
+                    rest_str = format_eta(rem_total)
 
                 batch_timer_placeholder.caption(
-                    f"⏱ **Весь пакет:** прошло **{_format_eta(elapsed)}** · "
+                    f"⏱ **Весь пакет:** прошло **{format_eta(elapsed)}** · "
                     f"осталось примерно **{rest_str}**"
                 )
 
@@ -1956,7 +1301,10 @@ def render_batch_tab(
         _batch_timer_thread.start()
 
         try:
-            for idx, ufile in enumerate(valid_batch_files):
+            for idx in range(start_idx, len(file_jobs)):
+                job = file_jobs[idx]
+                file_name = job.name or f"file_{idx+1}"
+                file_path = job.path
                 batch_ui["file_idx"] = idx
                 batch_ui["file_start"] = time.perf_counter()
                 batch_ui["current_progress"] = 0
@@ -1964,13 +1312,13 @@ def render_batch_tab(
                 file_ui_logs: list[str] = []
 
                 status_text.markdown(
-                    f"⏳ **Файл {idx + 1}/{total}** — `{ufile.name}`"
+                    f"⏳ **Файл {idx + 1}/{total}** — `{file_name}`"
                 )
                 progress_bar.progress(
                     idx / total, text=f"Пакет: файл {idx + 1} из {total}"
                 )
-                file_progress.progress(0, text=f"«{ufile.name}» — старт…")
-                steps_placeholder.markdown(_make_steps_html(-1, 0), unsafe_allow_html=True)
+                file_progress.progress(0, text=f"«{file_name}» — старт…")
+                steps_placeholder.markdown(make_steps_html(-1, 0), unsafe_allow_html=True)
                 batch_live_logs_placeholder.empty()
 
                 def _make_batch_file_logger(
@@ -1981,14 +1329,14 @@ def render_batch_tab(
                     def _cb(message: str) -> None:
                         logs_ref.append(message)
                         logs_ph.code("\n".join(logs_ref[-25:]) or "")
-                        bar_text, update_steps = _update_transcription_progress_from_log(
+                        bar_text, update_steps = update_transcription_progress_from_log(
                             message, st_local
                         )
                         batch_ui["current_progress"] = st_local.current_progress
                         if bar_text is not None:
                             if update_steps:
                                 steps_placeholder.markdown(
-                                    _make_steps_html(
+                                    make_steps_html(
                                         st_local.current_step, st_local.done_steps
                                     ),
                                     unsafe_allow_html=True,
@@ -2004,30 +1352,25 @@ def render_batch_tab(
                 )
 
                 try:
-                    suffix = Path(ufile.name).suffix or ".wav"
-                    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-                        tmp.write(ufile.getvalue())
-                        tmp_path = Path(tmp.name)
+                    if not file_path or not Path(file_path).exists():
+                        raise FileNotFoundError(f"Временный файл пакета не найден: {file_name}")
+                    tmp_path = Path(file_path)
 
-                    _, result, evaluation, _ = run_analysis(
-                        audio_path=str(tmp_path),
-                        model_name=model_name,
-                        compute_type=compute_type,
-                        asr_profile=asr_profile,
-                        heavy_diarization=heavy_mode,
-                        heavy_diarization_timeout_seconds=heavy_timeout,
-                        enable_post_edit=enable_post_edit,
-                        post_edit_timeout_seconds=60,
-                        operator_name=batch_operator_resolved,
-                        original_basename=ufile.name,
+                    analysis = analyze_call(
+                        AnalysisRequest(
+                            audio_path=str(tmp_path),
+                            operator_name=batch_operator_resolved,
+                            original_basename=file_name,
+                            cloud_eval_cfg=cloud_eval_cfg,
+                            cloud_eval_extra_instructions=(
+                                batch_cloud_eval_extra if cloud_eval_cfg is not None else None
+                            ),
+                        ),
+                        transcriber=cached_transcriber,
                         on_log=update_batch_file_log,
-                        enable_llm_post_edit=cloud_mode_active,
-                        llm_yandex_api_key=cloud_eval_cfg.api_key if cloud_eval_cfg else None,
-                        llm_yandex_folder_id=cloud_eval_cfg.folder_id if cloud_eval_cfg else None,
-                        llm_yandex_model=cloud_eval_cfg.model if cloud_eval_cfg else "yandexgpt-lite",
-                        llm_yandex_timeout=cloud_eval_cfg.timeout_seconds if cloud_eval_cfg else 60.0,
-                        cloud_eval_cfg=cloud_eval_cfg,
                     )
+                    result = analysis.result
+                    evaluation = analysis.evaluation
                     _file_wall = time.perf_counter() - batch_ui["file_start"]
                     batch_ui["completed_durations"].append(_file_wall)
                     # Обновляем калиброванный коэффициент proc_ratio
@@ -2037,53 +1380,55 @@ def render_batch_tab(
                     _total_audio = sum(batch_ui["completed_audio_est"])
                     if _total_audio > 0:
                         batch_ui["proc_ratio"] = _total_proc / _total_audio
-                    file_progress.progress(100, text=f"«{ufile.name}» — готово")
+                    file_progress.progress(100, text=f"«{file_name}» — готово")
                     steps_placeholder.markdown(
-                        _make_steps_html(-1, 5), unsafe_allow_html=True
+                        make_steps_html(-1, 5), unsafe_allow_html=True
                     )
 
-                    row = _result_to_row_dict(ufile.name, result, evaluation)
+                    row = result_to_row_dict(file_name, result, evaluation)
                     collected.append(row)
 
                     try:
-                        from transcription import build_report
-
-                        rpt = build_report(result, evaluation)
-                        out = ensure_results_dir() / f"{Path(ufile.name).stem}_report.txt"
-                        out.write_text(rpt, encoding="utf-8")
+                        out = ensure_results_dir() / f"{Path(file_name).stem}_report.txt"
+                        out.write_text(analysis.report, encoding="utf-8")
                     except Exception:
                         pass
 
                     if sheets_configured:
                         try:
                             ok, msg = append_analysis_row(
-                                original_filename=ufile.name,
-                                total_score=evaluation.total_score,
-                                max_score=evaluation.max_score,
-                                operator_name=evaluation.operator_name,
-                                applicant_name=evaluation.applicant_name or "",
-                                script_score=evaluation.script_score,
-                                speech_score=evaluation.speech_score,
-                                consultation_score=evaluation.consultation_score,
-                                engagement_score=evaluation.engagement_score,
-                                tone_summary=result.tone_summary,
-                                script_details=evaluation.script_details,
-                                positives=evaluation.positives,
-                                negatives=evaluation.negatives,
+                                **build_sheets_export_payload(
+                                    analysis,
+                                    original_filename=file_name,
+                                )
                             )
-                            sheets_log[ufile.name] = (
+                            sheets_log[file_name] = (
                                 "✅ Добавлено" if ok else f"⚠️ {msg[:60]}"
                             )
                         except Exception as exc:
-                            sheets_log[ufile.name] = f"❌ {str(exc)[:60]}"
+                            sheets_log[file_name] = f"❌ {str(exc)[:60]}"
 
                 except Exception as exc:
-                    errors[ufile.name] = str(exc)
+                    errors[file_name] = str(exc)
+
+                # Чекпоинт после каждого файла: при сбросе продолжаем с места.
+                save_batch_resume_state(
+                    BatchResumeState(
+                        created_at=time.time(),
+                        next_idx=idx + 1,
+                        operator_name=batch_operator_resolved or "",
+                        cloud_eval_extra=batch_cloud_eval_extra,
+                        files=file_jobs,
+                        collected=collected,
+                        errors=errors,
+                        sheets_log=sheets_log,
+                    )
+                )
 
                 progress_bar.progress(
                     (idx + 1) / total, text=f"Пакет: обработано {idx + 1} из {total}"
                 )
-                _render_live_batch_table(
+                render_live_batch_table(
                     live_table_placeholder,
                     collected,
                     errors,
@@ -2098,10 +1443,13 @@ def render_batch_tab(
         st.session_state["batch_results"] = collected
         st.session_state["batch_errors"] = errors
         st.session_state["batch_sheets_log"] = sheets_log
+        # Пакет завершён — удаляем checkpoint и временные файлы резюма.
+        if len(collected) + len(errors) >= total:
+            clear_batch_resume_state()
 
         total_elapsed = time.perf_counter() - batch_ui["batch_start"]
         batch_timer_placeholder.caption(
-            f"⏱ **Пакет завершён.** Всего времени: **{_format_eta(total_elapsed)}**"
+            f"⏱ **Пакет завершён.** Всего времени: **{format_eta(total_elapsed)}**"
         )
         progress_bar.progress(1.0, text="Пакет: готово!")
         ok_cnt = len(collected)
@@ -2112,7 +1460,7 @@ def render_batch_tab(
             summary += f" · Ошибок: {err_cnt}"
         if sheets_configured:
             summary += f" · В Google Таблицу: {sheets_ok_cnt}/{ok_cnt}"
-        summary += f" · ⏱ {_format_eta(total_elapsed)}"
+        summary += f" · ⏱ {format_eta(total_elapsed)}"
         status_text.markdown(summary)
 
     # ── Результаты ──────────────────────────────────────────────────────────
@@ -2178,10 +1526,8 @@ def render_batch_tab(
             return "background-color: #dcfce7; color: #166534; font-weight: 600"
 
         score_cols = ["Итог", "Скрипт", "Речь", "Консультация", "Вовлечённость"]
-        styled = (
-            df.style
-            .applymap(color_score, subset=score_cols)
-            .applymap(color_review, subset=["Прослушать"])
+        styled = df.style.map(color_score, subset=score_cols).map(
+            color_review, subset=["Прослушать"]
         )
         st.dataframe(styled, width="stretch", hide_index=True)
 
@@ -2197,7 +1543,7 @@ def render_batch_tab(
                     f"Ошибки: {', '.join(failed)}"
                 )
         else:
-            st.caption("Google Таблица не настроена. Добавьте `keygoogle.json` в папку проекта.")
+            st.caption(f"Google Таблица не настроена. {sheets_config_hint()}")
 
         # CSV
         csv_buf = io.StringIO()

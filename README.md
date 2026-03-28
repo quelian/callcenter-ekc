@@ -2,7 +2,7 @@
 
 Локальное приложение для транскрибации звонков и QA-оценки диалогов колл-центра.
 
-**Текущая версия:** Beta 1.0 (23.03.2026) — см. [CHANGELOG.md](CHANGELOG.md).
+**Текущая версия:** Beta 1.1 (24.03.2026) — см. [CHANGELOG.md](CHANGELOG.md).
 
 - **Windows (скачать с GitHub, cmd, запуск):** [docs/WINDOWS.md](docs/WINDOWS.md)  
 - **GitHub:** первый push и синхронизация — [docs/GITHUB_SETUP.md](docs/GITHUB_SETUP.md)
@@ -47,7 +47,15 @@ pip install -r requirements.txt
 streamlit run web_gui.py
 ```
 
-**Админ-панель** (сайдбар): ключи Yandex и таблица Google — только после пароля (по умолчанию **`9632`**; свой пароль: `ADMIN_PANEL_PASSWORD` в `.env`). Сохранение в `.env`.
+**Админ-панель** (сайдбар): ключи Yandex и таблица Google — только после пароля. Для включения задайте `ADMIN_PANEL_PASSWORD` в `.env`; без этого админ-панель отключена. Сохранение идёт в `.env`.
+
+Для разработки:
+
+```bash
+pip install -e .[dev]
+pytest
+ruff check app_config.py analysis_service.py batch_state.py env_store.py state_paths.py web_gui.py transcription.py sheets_export.py llm_cloud_eval.py tests
+```
 
 ### Интерфейс загрузки файлов (русский + 5 файлов на страницу)
 

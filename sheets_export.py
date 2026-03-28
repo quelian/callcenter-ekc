@@ -23,7 +23,7 @@
   1. Google Cloud: сервисный аккаунт, JSON-ключ.
   2. Таблицу «Поделиться» с email сервисного аккаунта (редактор).
   3. В .env: GOOGLE_SHEETS_CREDENTIALS_JSON=/abs/path/to/key.json
-     опционально GOOGLE_SHEETS_SPREADSHEET_ID
+     обязательно GOOGLE_SHEETS_SPREADSHEET_ID
      опционально GOOGLE_SHEETS_WORKSHEET — имя листа (по умолчанию первый)
      GOOGLE_SHEETS_HAS_HEADER=true — если в 1-й строке заголовки
 """
@@ -31,12 +31,11 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 from pathlib import Path
 from typing import Any
 
-DEFAULT_SPREADSHEET_ID = "171ix3FDr7kWzMZMykOwYTd5f6jZ7j3tjJEKzF7W4_1M"
+from app_config import GoogleSheetsSettings, load_app_config
 
 _DEFAULT_HAS_HEADER = True
 
@@ -52,11 +51,16 @@ def invalidate_worksheet_cache() -> None:
     _worksheet_cache_ws = None
 
 
+def _settings() -> GoogleSheetsSettings:
+    return load_app_config().google_sheets
+
+
 def _worksheet_fingerprint() -> str:
     path = _credentials_path()
     p = str(path.resolve()) if path is not None else ""
-    sid = (os.environ.get("GOOGLE_SHEETS_SPREADSHEET_ID") or DEFAULT_SPREADSHEET_ID).strip()
-    wname = (os.environ.get("GOOGLE_SHEETS_WORKSHEET") or "").strip()
+    settings = _settings()
+    sid = settings.spreadsheet_id or ""
+    wname = settings.worksheet or ""
     return f"{p}|{sid}|{wname}"
 
 # Ключевые слова в «Минусах», которые означают критическое нарушение
@@ -161,9 +165,8 @@ def _service_account_email(creds_path: Path) -> str | None:
 
 
 def _credentials_path() -> Path | None:
-    raw = (os.environ.get("GOOGLE_SHEETS_CREDENTIALS_JSON") or "").strip()
-    if not raw:
-        raw = (os.environ.get("GOOGLE_APPLICATION_CREDENTIALS") or "").strip()
+    settings = _settings()
+    raw = settings.credentials_json or settings.application_credentials or ""
     if raw:
         resolved = _resolve_json_key_path(raw)
         if resolved is not None:
@@ -183,7 +186,10 @@ def _open_worksheet_uncached():
     if path is None:
         return None, "JSON ключ не найден (см. GOOGLE_SHEETS_CREDENTIALS_JSON или keygoogle.json в проекте)"
 
-    sid = (os.environ.get("GOOGLE_SHEETS_SPREADSHEET_ID") or DEFAULT_SPREADSHEET_ID).strip()
+    settings = _settings()
+    sid = settings.spreadsheet_id or ""
+    if not sid:
+        return None, "Не задан GOOGLE_SHEETS_SPREADSHEET_ID — укажите ID или ссылку на таблицу в .env / Админ-панели"
     sa_email = _service_account_email(path)
     email_hint = f" Добавьте в доступ таблицы email из ключа: `{sa_email}` (роль «Редактор»)." if sa_email else ""
 
@@ -212,7 +218,7 @@ def _open_worksheet_uncached():
         tail = f" (причина: {cause})" if cause is not None else ""
         return None, f"Не удалось открыть таблицу по ID `{sid}`: {type(exc).__name__}: {exc!r}.{tail}"
 
-    wname = (os.environ.get("GOOGLE_SHEETS_WORKSHEET") or "").strip()
+    wname = settings.worksheet or ""
     if wname:
         try:
             ws = sh.worksheet(wname)
@@ -331,7 +337,8 @@ def append_analysis_row(
     Добавляет одну строку (16 колонок) в таблицу.
     Возвращает (успех, сообщение).
     """
-    if os.environ.get("GOOGLE_SHEETS_DISABLE", "").strip().lower() in ("1", "true", "yes"):
+    settings = _settings()
+    if settings.disabled:
         return False, "Экспорт отключён (GOOGLE_SHEETS_DISABLE)"
 
     path = _credentials_path()
@@ -345,9 +352,7 @@ def append_analysis_row(
             if ws is None:
                 return False, err or "не удалось открыть таблицу"
 
-            has_header = os.environ.get("GOOGLE_SHEETS_HAS_HEADER", str(_DEFAULT_HAS_HEADER)).lower() in (
-                "1", "true", "yes",
-            )
+            has_header = settings.has_header
             serial = _next_serial(ws, has_header)
             row = _build_row(
                 serial=serial,
@@ -367,10 +372,7 @@ def append_analysis_row(
                 filename_meta_override=filename_meta_override,
             )
             ws.append_row(row, value_input_option="USER_ENTERED")
-            url = (
-                f"https://docs.google.com/spreadsheets/d/"
-                f"{(os.environ.get('GOOGLE_SHEETS_SPREADSHEET_ID') or DEFAULT_SPREADSHEET_ID).strip()}/edit"
-            )
+            url = settings.spreadsheet_url or "таблица не настроена"
             return True, f"Строка {serial} добавлена. Откройте таблицу: {url}"
         except Exception as exc:
             last_exc = exc
@@ -404,7 +406,8 @@ def append_batch_rows(
     if not rows_data:
         return False, "Нет данных для экспорта."
 
-    if os.environ.get("GOOGLE_SHEETS_DISABLE", "").strip().lower() in ("1", "true", "yes"):
+    settings = _settings()
+    if settings.disabled:
         return False, "Экспорт отключён (GOOGLE_SHEETS_DISABLE)"
 
     path = _credentials_path()
@@ -418,9 +421,7 @@ def append_batch_rows(
             if ws is None:
                 return False, err or "не удалось открыть таблицу"
 
-            has_header = os.environ.get("GOOGLE_SHEETS_HAS_HEADER", str(_DEFAULT_HAS_HEADER)).lower() in (
-                "1", "true", "yes",
-            )
+            has_header = settings.has_header
             start_serial = _next_serial(ws, has_header)
 
             built_rows = []
@@ -443,10 +444,7 @@ def append_batch_rows(
                 ))
 
             ws.append_rows(built_rows, value_input_option="USER_ENTERED")
-            url = (
-                f"https://docs.google.com/spreadsheets/d/"
-                f"{(os.environ.get('GOOGLE_SHEETS_SPREADSHEET_ID') or DEFAULT_SPREADSHEET_ID).strip()}/edit"
-            )
+            url = settings.spreadsheet_url or "таблица не настроена"
             return True, (
                 f"Добавлено {len(built_rows)} строк (№{start_serial}–{start_serial + len(built_rows) - 1}). "
                 f"Откройте таблицу: {url}"
@@ -468,23 +466,27 @@ def append_batch_rows(
 
 
 def is_sheets_configured() -> bool:
-    return _credentials_path() is not None
+    settings = _settings()
+    return bool(_credentials_path() is not None and settings.spreadsheet_id and not settings.disabled)
 
 
 def sheets_config_hint() -> str:
+    settings = _settings()
     cp = _credentials_path()
-    if cp is not None:
-        return f"Ключ сервисного аккаунта: `{cp}`"
-    raw = (os.environ.get("GOOGLE_SHEETS_CREDENTIALS_JSON") or "").strip() or (
-        os.environ.get("GOOGLE_APPLICATION_CREDENTIALS") or ""
-    ).strip()
+    if cp is not None and settings.spreadsheet_id:
+        return f"Ключ сервисного аккаунта: `{cp}`; таблица: `{settings.spreadsheet_id}`"
+    if cp is not None and not settings.spreadsheet_id:
+        return (
+            f"Ключ найден: `{cp}`, но не задан `GOOGLE_SHEETS_SPREADSHEET_ID`. "
+            "Укажите ID или ссылку на таблицу в `.env`."
+        )
+    raw = settings.credentials_json or settings.application_credentials or ""
     if raw and _resolve_json_key_path(raw) is None:
         return (
             f"В .env указан путь `{raw}`, но файл не найден. cwd=`{Path.cwd()}`, проект=`{_project_root()}`."
         )
     return (
-        "Нет JSON-ключа: добавьте `keygoogle.json` в папку проекта или строку в `.env`: "
-        "`GOOGLE_SHEETS_CREDENTIALS_JSON=keygoogle.json`"
+        "Нет полной настройки Google Sheets: добавьте JSON-ключ и `GOOGLE_SHEETS_SPREADSHEET_ID`."
     )
 
 

@@ -15,6 +15,7 @@ import threading
 from typing import Callable
 
 from llm_post_edit import _SYSTEM_PROMPT, _parse_llm_blocks, _user_prompt, _validate_output
+from role_misattribution_fix import fix_operator_thanks_mislabeled_as_applicant
 
 # DeepSeek (дистиллят Qwen 1.5B) — баланс качества и размера для CPU/GPU ноутбука
 DEFAULT_HF_MODEL_ID = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
@@ -171,11 +172,14 @@ def run_embedded_llm_post_edit(
     if not full or not roles:
         return None, None, "parse_blocks_failed"
 
+    roles, pe_fix = fix_operator_thanks_mislabeled_as_applicant(roles)
+    fix_sfx = ":autofix_operator_thanks" if pe_fix else ""
+
     ok, reason = _validate_output(flat_text, full, roles)
     if not ok:
         return None, None, f"validation:{reason}"
 
-    return full, roles, "ok"
+    return full, roles, f"ok{fix_sfx}"
 
 
 def run_embedded_llm_post_edit_threaded(

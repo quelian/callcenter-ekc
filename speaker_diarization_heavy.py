@@ -5,6 +5,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass
 
 import numpy as np
+from audio_io_safe import load_audio_mono_16k_safe
 
 
 @dataclass
@@ -94,7 +95,7 @@ def run_heavy_diarization(
         return [], f"не удалось загрузить heavy speaker model: {exc}", diagnostics
 
     try:
-        wav, sr = librosa.load(audio_path, sr=16000, mono=True)
+        wav, sr = load_audio_mono_16k_safe(audio_path)
     except Exception as exc:
         return [], f"не удалось прочитать аудио: {exc}", diagnostics
     if wav.size == 0:
@@ -180,6 +181,11 @@ def run_heavy_diarization(
     if len(set(labels.tolist())) < 2:
         labels = _forced_bipartition_labels(embs)
         diagnostics["split_mode"] = "forced"
+
+    from speaker_voice_dual_encoder import fuse_ecapa_resemblyzer_from_windows
+
+    labels = fuse_ecapa_resemblyzer_from_windows(windows, embs, labels, diagnostics)
+    labels = np.asarray(labels, dtype=np.int32)
 
     # Качество кластеров: inter / intra cosine distance.
     clusters_embs: dict[int, list[np.ndarray]] = {}

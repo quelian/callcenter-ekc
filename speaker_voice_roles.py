@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from audio_io_safe import load_audio_mono_16k_safe
 
 
 def _normalize_rows(x):
@@ -255,10 +256,8 @@ def cluster_voice_segments(
     load_duration = seg_end_sec - seg_start_sec
 
     try:
-        wav, sr = librosa.load(
+        wav, sr = load_audio_mono_16k_safe(
             str(path),
-            sr=16000,
-            mono=True,
             offset=load_offset,
             duration=load_duration,
         )
@@ -456,6 +455,11 @@ def cluster_voice_segments(
         if labels is not None:
             cluster_ids = sorted(set(int(x) for x in labels))
 
+    # Двойной голосовой энкодер: Resemblyzer (d-vector) + согласование с ECAPA на тех же окнах.
+    from speaker_voice_dual_encoder import fuse_ecapa_resemblyzer_from_windows
+
+    labels = fuse_ecapa_resemblyzer_from_windows(vad_window_audio, embs, labels, diagnostics)
+
     # ------------------------------------------------------------------
     # 5. Маппинг VAD-окон → Whisper-сегменты через временное перекрытие.
     #
@@ -540,8 +544,16 @@ def cluster_voice_segments(
 
     diagnostics["reason"] = "ok_forced_split" if forced_mode else "ok_native"
     diagnostics["split_mode"] = "forced" if forced_mode else "native"
+    _dual = diagnostics.get("dual_voice_encoder")
+    _dual_suffix = ""
+    if _dual == "ok":
+        _n = int(diagnostics.get("dual_voice_flips_to_resemb") or 0)
+        _dual_suffix = f"; двойной голос: Resemblyzer, споров снято={_n}"
+    elif _dual and _dual != "disabled":
+        _dual_suffix = f"; двойной голос: {_dual}"
     return (
         smoothed,
-        f"успех (ECAPA-TDNN): VAD-регионов {len(vad_regions)}, окон {len(vad_window_times)}, итоговых {len(smoothed)}, кластеров {len({x[3] for x in smoothed})}",
+        f"успех (ECAPA-TDNN{_dual_suffix}): VAD-регионов {len(vad_regions)}, окон {len(vad_window_times)}, "
+        f"итоговых {len(smoothed)}, кластеров {len({x[3] for x in smoothed})}",
         diagnostics,
     )

@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=70"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "callcenter-qa-app"
+version = "0.1.0"
+description = "Local call-center QA analyzer for transcription, diarization, and evaluation."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "accelerate>=0.30.0",
+  "ctranslate2>=4.4.0",
+  "deepmultilingualpunctuation>=1.0.1",
+  "faster-whisper>=1.0.3",
+  "google-auth>=2.25.0",
+  "gspread>=6.0.0",
+  "librosa>=0.10.2",
+  "numpy>=1.26.0",
+  "python-dotenv>=1.0.0",
+  "resemblyzer>=0.1.4",
+  "safetensors>=0.4.0",
+  "scikit-learn>=1.3.0",
+  "scipy>=1.12.0",
+  "setuptools<81",
+  "soundfile>=0.12.0",
+  "speechbrain>=1.0.2",
+  "streamlit>=1.36.0",
+  "torch>=2.1.0",
+  "torchaudio>=2.1.0",
+  "transformers>=4.40.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3.5",
+  "ruff>=0.11.0",
+]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F811", "F821", "F822", "F823"]
+ignore = ["E402"]
