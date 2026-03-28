@@ -589,8 +589,90 @@ def _resolve_applicant_name_for_merge(
     if not name and (applicant_text_raw or "").strip():
         name = ev._extract_name_from_applicant_reply(applicant_text_raw)
     if not name:
-        name = ev._find_applicant_name(applicant_text_raw or flat_text)
+        name = ev._find_applicant_name(
+            applicant_text_raw or flat_text,
+            operator_text_lower=ev._extract_role_text(role_text, "Оператор").lower(),
+            applicant_text_lower=applicant_text_raw.lower(),
+        )
     return normalize_applicant_name_candidate(name or "")
+
+
+def _candidate_name_support_score(
+    candidate: str | None,
+    *,
+    flat_text: str,
+    role_text: str,
+) -> int:
+    from transcription import CallQualityEvaluator
+
+    normalized = normalize_applicant_name_candidate(str(candidate or ""))
+    if not normalized:
+        return 0
+    ev = CallQualityEvaluator()
+    direct = ev._find_applicant_name_from_dialog(role_text)
+    if direct == normalized:
+        return 100
+    operator_lower = ev._extract_role_text(role_text, "Оператор").lower()
+    applicant_lower = ev._extract_role_text(role_text, "Заявитель").lower()
+    op_hits = ev._count_applicant_name_token_in_text(operator_lower, normalized)
+    applicant_hits = ev._count_applicant_name_token_in_text(applicant_lower, normalized)
+    dialog_hits = ev._count_applicant_name_token_in_text(
+        f"{operator_lower} {applicant_lower}".strip(),
+        normalized,
+    )
+    if op_hits >= 2:
+        return 80 + op_hits
+    if dialog_hits >= 3:
+        return 60 + dialog_hits
+    if applicant_hits >= 1:
+        return 30 + applicant_hits
+    return 0
+
+
+def _choose_final_applicant_name(
+    *,
+    current_applicant: str | None,
+    applicant_only: str | None,
+    heuristic_applicant: str | None,
+    flat_text: str,
+    role_text: str,
+) -> str | None:
+    candidates = [
+        (
+            heuristic_applicant,
+            1000 + _candidate_name_support_score(
+                heuristic_applicant,
+                flat_text=flat_text,
+                role_text=role_text,
+            ),
+        ),
+        (
+            applicant_only,
+            100 + _candidate_name_support_score(
+                applicant_only,
+                flat_text=flat_text,
+                role_text=role_text,
+            ),
+        ),
+        (
+            current_applicant,
+            _candidate_name_support_score(
+                current_applicant,
+                flat_text=flat_text,
+                role_text=role_text,
+            ),
+        ),
+    ]
+    best_name: str | None = None
+    best_score = 0
+    for candidate, score in candidates:
+        normalized = normalize_applicant_name_candidate(str(candidate or ""))
+        if not normalized:
+            continue
+        if score > best_score:
+            best_name = normalized
+            best_score = score
+    return best_name
 
 
 def apply_deterministic_name_mentions_merge(
@@ -1151,12 +1233,13 @@ def run_cloud_evaluation(
             current_candidate=current_applicant,
         )
         heuristic_applicant = _resolve_applicant_name_for_merge(flat_text, role_text)
-        if applicant_only:
-            resolved_applicant = applicant_only
-        elif current_applicant and heuristic_applicant == current_applicant:
-            resolved_applicant = current_applicant
-        else:
-            resolved_applicant = heuristic_applicant
+        resolved_applicant = _choose_final_applicant_name(
+            current_applicant=current_applicant,
+            applicant_only=applicant_only,
+            heuristic_applicant=heuristic_applicant,
+            flat_text=flat_text,
+            role_text=role_text,
+        )
         if applicant_only and applicant_only != current_applicant:
             _log(f"[cloud_eval] Нейровалидация applicant_name уточнила имя: «{applicant_only}».")
         elif current_applicant and current_applicant != resolved_applicant:

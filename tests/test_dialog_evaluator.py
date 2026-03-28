@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from applicant_name_utils import normalize_applicant_name_candidate
-from llm_cloud_eval import apply_deterministic_speech_findings_merge
+from llm_cloud_eval import (
+    _choose_final_applicant_name,
+    apply_deterministic_speech_findings_merge,
+)
 from transcription import CallQualityEvaluator, QualityEvaluation, TranscriptionResult, build_report
 
 
@@ -123,6 +126,7 @@ def test_applicant_name_normalizer_rejects_obvious_non_names() -> None:
     assert normalize_applicant_name_candidate("Воскресенье") is None
     assert normalize_applicant_name_candidate("Такое") is None
     assert normalize_applicant_name_candidate("Добрый день") is None
+    assert normalize_applicant_name_candidate("Девушка") is None
     assert normalize_applicant_name_candidate("Анна") == "Анна"
     assert normalize_applicant_name_candidate("мирослава строфская") == "Мирослава Строфская"
 
@@ -133,6 +137,25 @@ def test_call_quality_evaluator_skips_non_name_applicant_reply() -> None:
         [
             "Оператор: Как вас зовут?",
             "Заявитель: Воскресенье.",
+            "Оператор: Чем могу помочь?",
+        ]
+    )
+
+    evaluation = evaluator.evaluate(
+        transcript=role_text.replace("\n", " "),
+        role_transcript=role_text,
+        forced_operator_name="Егор",
+    )
+
+    assert evaluation.applicant_name is None
+
+
+def test_call_quality_evaluator_skips_polite_phrase_after_name_question() -> None:
+    evaluator = CallQualityEvaluator()
+    role_text = "\n".join(
+        [
+            "Оператор: Как вас зовут?",
+            "Заявитель: Очень приятно.",
             "Оператор: Чем могу помочь?",
         ]
     )
@@ -189,3 +212,24 @@ def test_cloud_eval_postprocess_keeps_final_applicant_name_consistent_in_negativ
     joined = "\n".join(evaluation.negatives)
     assert "«Анна»" in joined
     assert "«Наталья»" not in joined
+
+
+def test_cloud_applicant_name_choice_prefers_dialog_supported_candidate() -> None:
+    role_text = "\n".join(
+        [
+            "Оператор: Здравствуйте, как вас зовут?",
+            "Заявитель: Меня зовут Наталья.",
+            "Оператор: Наталья, подскажите номер заявления.",
+        ]
+    )
+    flat_text = role_text.replace("\n", " ")
+
+    resolved = _choose_final_applicant_name(
+        current_applicant="Анна",
+        applicant_only="Анна",
+        heuristic_applicant="Наталья",
+        flat_text=flat_text,
+        role_text=role_text,
+    )
+
+    assert resolved == "Наталья"

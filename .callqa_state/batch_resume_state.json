@@ -1,0 +1,332 @@
+{
+  "version": 1,
+  "created_at": 1774716638.7913458,
+  "next_idx": 1,
+  "operator_name": "Анастасия",
+  "cloud_eval_extra": "",
+  "files": [
+    {
+      "name": "06-03-2026_7 (423) 239-30-55_00-55.mp3",
+      "path": "/Users/egor/callcenter-qa-app/.callqa_state/batch_resume_files/0001_06-03-2026_7_423_239-30-55_00-55.mp3",
+      "size": 248747
+    },
+    {
+      "name": "06-03-2026_7 (423) 265-24-24_00-53.mp3",
+      "path": "/Users/egor/callcenter-qa-app/.callqa_state/batch_resume_files/0002_06-03-2026_7_423_265-24-24_00-53.mp3",
+      "size": 268441
+    },
+    {
+      "name": "06-03-2026_7 (423) 265-24-24_05-00.mp3",
+      "path": "/Users/egor/callcenter-qa-app/.callqa_state/batch_resume_files/0003_06-03-2026_7_423_265-24-24_05-00.mp3",
+      "size": 733287
+    },
+    {
+      "name": "06-03-2026_7 (902) 528-03-29_01-45.mp3",
+      "path": "/Users/egor/callcenter-qa-app/.callqa_state/batch_resume_files/0004_06-03-2026_7_902_528-03-29_01-45.mp3",
+      "size": 427847
+    },
+    {
+      "name": "06-03-2026_7 (908) 989-18-48_03-27.mp3",
+      "path": "/Users/egor/callcenter-qa-app/.callqa_state/batch_resume_files/0005_06-03-2026_7_908_989-18-48_03-27.mp3",
+      "size": 564660
+    },
+    {
+      "name": "06-03-2026_7 (909) 821-59-99_01-30.mp3",
+      "path": "/Users/egor/callcenter-qa-app/.callqa_state/batch_resume_files/0006_06-03-2026_7_909_821-59-99_01-30.mp3",
+      "size": 913953
+    },
+    {
+      "name": "06-03-2026_7 (909) 873-05-56_00-56.mp3",
+      "path": "/Users/egor/callcenter-qa-app/.callqa_state/batch_resume_files/0007_06-03-2026_7_909_873-05-56_00-56.mp3",
+      "size": 437029
+    },
+    {
+      "name": "06-03-2026_7 (914) 404-36-31_01-15.mp3",
+      "path": "/Users/egor/callcenter-qa-app/.callqa_state/batch_resume_files/0008_06-03-2026_7_914_404-36-31_01-15.mp3",
+      "size": 520631
+    },
+    {
+      "name": "06-03-2026_7 (914) 575-84-67_02-04.mp3",
+      "path": "/Users/egor/callcenter-qa-app/.callqa_state/batch_resume_files/0009_06-03-2026_7_914_575-84-67_02-04.mp3",
+      "size": 646094
+    },
+    {
+      "name": "06-03-2026_7 (914) 609-44-36_01-55.mp3",
+      "path": "/Users/egor/callcenter-qa-app/.callqa_state/batch_resume_files/0010_06-03-2026_7_914_609-44-36_01-55.mp3",
+      "size": 455890
+    },
+    {
+      "name": "06-03-2026_7 (914) 651-58-37_02-48.mp3",
+      "path": "/Users/egor/callcenter-qa-app/.callqa_state/batch_resume_files/0011_06-03-2026_7_914_651-58-37_02-48.mp3",
+      "size": 706877
+    },
+    {
+      "name": "06-03-2026_7 (914) 716-40-57_01-55.mp3",
+      "path": "/Users/egor/callcenter-qa-app/.callqa_state/batch_resume_files/0012_06-03-2026_7_914_716-40-57_01-55.mp3",
+      "size": 545743
+    },
+    {
+      "name": "06-03-2026_7 (914) 721-29-06_01-19.mp3",
+      "path": "/Users/egor/callcenter-qa-app/.callqa_state/batch_resume_files/0013_06-03-2026_7_914_721-29-06_01-19.mp3",
+      "size": 604067
+    },
+    {
+      "name": "06-03-2026_7 (914) 787-35-50_03-03.mp3",
+      "path": "/Users/egor/callcenter-qa-app/.callqa_state/batch_resume_files/0014_06-03-2026_7_914_787-35-50_03-03.mp3",
+      "size": 574738
+    },
+    {
+      "name": "06-03-2026_7 (914) 961-99-37_01-25.mp3",
+      "path": "/Users/egor/callcenter-qa-app/.callqa_state/batch_resume_files/0015_06-03-2026_7_914_961-99-37_01-25.mp3",
+      "size": 283453
+    },
+    {
+      "name": "06-03-2026_7 (924) 120-88-57_01-07.mp3",
+      "path": "/Users/egor/callcenter-qa-app/.callqa_state/batch_resume_files/0016_06-03-2026_7_924_120-88-57_01-07.mp3",
+      "size": 3138141
+    },
+    {
+      "name": "06-03-2026_7 (924) 339-26-22_02-19.mp3",
+      "path": "/Users/egor/callcenter-qa-app/.callqa_state/batch_resume_files/0017_06-03-2026_7_924_339-26-22_02-19.mp3",
+      "size": 504015
+    },
+    {
+      "name": "06-03-2026_7 (958) 542-53-57_00-00.mp3",
+      "path": "/Users/egor/callcenter-qa-app/.callqa_state/batch_resume_files/0018_06-03-2026_7_958_542-53-57_00-00.mp3",
+      "size": 402895
+    },
+    {
+      "name": "06-03-2026_7 (958) 542-53-57_02-04.mp3",
+      "path": "/Users/egor/callcenter-qa-app/.callqa_state/batch_resume_files/0019_06-03-2026_7_958_542-53-57_02-04.mp3",
+      "size": 402895
+    },
+    {
+      "name": "06-03-2026_7 (962) 122-26-21_02-08.mp3",
+      "path": "/Users/egor/callcenter-qa-app/.callqa_state/batch_resume_files/0020_06-03-2026_7_962_122-26-21_02-08.mp3",
+      "size": 1208983
+    },
+    {
+      "name": "06-03-2026_7 (965) 699-55-21_01-05.mp3",
+      "path": "/Users/egor/callcenter-qa-app/.callqa_state/batch_resume_files/0021_06-03-2026_7_965_699-55-21_01-05.mp3",
+      "size": 709757
+    },
+    {
+      "name": "06-03-2026_7 (994) 994-00-74_00-56.mp3",
+      "path": "/Users/egor/callcenter-qa-app/.callqa_state/batch_resume_files/0022_06-03-2026_7_994_994-00-74_00-56.mp3",
+      "size": 313652
+    },
+    {
+      "name": "06-03-2026_7 (995) 525-86-05_02-27.mp3",
+      "path": "/Users/egor/callcenter-qa-app/.callqa_state/batch_resume_files/0023_06-03-2026_7_995_525-86-05_02-27.mp3",
+      "size": 464924
+    },
+    {
+      "name": "06-03-2026_7 (999) 631-02-83_00-55.mp3",
+      "path": "/Users/egor/callcenter-qa-app/.callqa_state/batch_resume_files/0024_06-03-2026_7_999_631-02-83_00-55.mp3",
+      "size": 742075
+    },
+    {
+      "name": "13-03-2026_7 (423) 234-34-80_02-05.mp3",
+      "path": "/Users/egor/callcenter-qa-app/.callqa_state/batch_resume_files/0025_13-03-2026_7_423_234-34-80_02-05.mp3",
+      "size": 684980
+    },
+    {
+      "name": "13-03-2026_7 (910) 332-38-25_02-07.mp3",
+      "path": "/Users/egor/callcenter-qa-app/.callqa_state/batch_resume_files/0026_13-03-2026_7_910_332-38-25_02-07.mp3",
+      "size": 812413
+    },
+    {
+      "name": "13-03-2026_7 (914) 216-12-85_00-56.mp3",
+      "path": "/Users/egor/callcenter-qa-app/.callqa_state/batch_resume_files/0027_13-03-2026_7_914_216-12-85_00-56.mp3",
+      "size": 658919
+    },
+    {
+      "name": "13-03-2026_7 (914) 678-68-08_00-55.mp3",
+      "path": "/Users/egor/callcenter-qa-app/.callqa_state/batch_resume_files/0028_13-03-2026_7_914_678-68-08_00-55.mp3",
+      "size": 111714
+    },
+    {
+      "name": "13-03-2026_7 (914) 678-68-08_05-03.mp3",
+      "path": "/Users/egor/callcenter-qa-app/.callqa_state/batch_resume_files/0029_13-03-2026_7_914_678-68-08_05-03.mp3",
+      "size": 933880
+    },
+    {
+      "name": "13-03-2026_7 (914) 734-98-83_01-06.mp3",
+      "path": "/Users/egor/callcenter-qa-app/.callqa_state/batch_resume_files/0030_13-03-2026_7_914_734-98-83_01-06.mp3",
+      "size": 197260
+    },
+    {
+      "name": "13-03-2026_7 (914) 796-37-89_01-06.mp3",
+      "path": "/Users/egor/callcenter-qa-app/.callqa_state/batch_resume_files/0031_13-03-2026_7_914_796-37-89_01-06.mp3",
+      "size": 333413
+    },
+    {
+      "name": "13-03-2026_7 (914) 962-24-50_01-08.mp3",
+      "path": "/Users/egor/callcenter-qa-app/.callqa_state/batch_resume_files/0032_13-03-2026_7_914_962-24-50_01-08.mp3",
+      "size": 430976
+    },
+    {
+      "name": "13-03-2026_7 (916) 290-34-91_02-06.mp3",
+      "path": "/Users/egor/callcenter-qa-app/.callqa_state/batch_resume_files/0033_13-03-2026_7_916_290-34-91_02-06.mp3",
+      "size": 1684830
+    },
+    {
+      "name": "13-03-2026_7 (924) 234-77-81_01-10.mp3",
+      "path": "/Users/egor/callcenter-qa-app/.callqa_state/batch_resume_files/0034_13-03-2026_7_924_234-77-81_01-10.mp3",
+      "size": 563153
+    },
+    {
+      "name": "13-03-2026_7 (952) 878-99-33_00-55.mp3",
+      "path": "/Users/egor/callcenter-qa-app/.callqa_state/batch_resume_files/0035_13-03-2026_7_952_878-99-33_00-55.mp3",
+      "size": 202506
+    },
+    {
+      "name": "13-03-2026_7 (952) 878-99-33_01-49.mp3",
+      "path": "/Users/egor/callcenter-qa-app/.callqa_state/batch_resume_files/0036_13-03-2026_7_952_878-99-33_01-49.mp3",
+      "size": 361050
+    },
+    {
+      "name": "14-03-2026_7 (908) 979-76-30_02-06.mp3",
+      "path": "/Users/egor/callcenter-qa-app/.callqa_state/batch_resume_files/0037_14-03-2026_7_908_979-76-30_02-06.mp3",
+      "size": 461412
+    },
+    {
+      "name": "14-03-2026_7 (911) 468-78-84_02-06.mp3",
+      "path": "/Users/egor/callcenter-qa-app/.callqa_state/batch_resume_files/0038_14-03-2026_7_911_468-78-84_02-06.mp3",
+      "size": 634340
+    },
+    {
+      "name": "14-03-2026_7 (914) 699-41-34_02-05.mp3",
+      "path": "/Users/egor/callcenter-qa-app/.callqa_state/batch_resume_files/0039_14-03-2026_7_914_699-41-34_02-05.mp3",
+      "size": 534216
+    },
+    {
+      "name": "14-03-2026_7 (914) 730-61-80_02-06.mp3",
+      "path": "/Users/egor/callcenter-qa-app/.callqa_state/batch_resume_files/0040_14-03-2026_7_914_730-61-80_02-06.mp3",
+      "size": 506267
+    },
+    {
+      "name": "14-03-2026_7 (914) 770-83-84_02-07.mp3",
+      "path": "/Users/egor/callcenter-qa-app/.callqa_state/batch_resume_files/0041_14-03-2026_7_914_770-83-84_02-07.mp3",
+      "size": 542334
+    },
+    {
+      "name": "14-03-2026_7 (924) 248-47-52_02-07.mp3",
+      "path": "/Users/egor/callcenter-qa-app/.callqa_state/batch_resume_files/0042_14-03-2026_7_924_248-47-52_02-07.mp3",
+      "size": 652872
+    },
+    {
+      "name": "14-03-2026_7 (939) 495-52-88_02-06.mp3",
+      "path": "/Users/egor/callcenter-qa-app/.callqa_state/batch_resume_files/0043_14-03-2026_7_939_495-52-88_02-06.mp3",
+      "size": 835652
+    },
+    {
+      "name": "14-03-2026_7 (962) 297-50-37_02-06.mp3",
+      "path": "/Users/egor/callcenter-qa-app/.callqa_state/batch_resume_files/0044_14-03-2026_7_962_297-50-37_02-06.mp3",
+      "size": 683963
+    },
+    {
+      "name": "14-03-2026_7 (989) 276-87-58_03-25.mp3",
+      "path": "/Users/egor/callcenter-qa-app/.callqa_state/batch_resume_files/0045_14-03-2026_7_989_276-87-58_03-25.mp3",
+      "size": 569939
+    },
+    {
+      "name": "19-03-2026_7 (423) 234-34-16_05-09.mp3",
+      "path": "/Users/egor/callcenter-qa-app/.callqa_state/batch_resume_files/0046_19-03-2026_7_423_234-34-16_05-09.mp3",
+      "size": 1075205
+    },
+    {
+      "name": "19-03-2026_7 (423) 265-24-24_01-56.mp3",
+      "path": "/Users/egor/callcenter-qa-app/.callqa_state/batch_resume_files/0047_19-03-2026_7_423_265-24-24_01-56.mp3",
+      "size": 487931
+    },
+    {
+      "name": "19-03-2026_7 (904) 576-76-92_03-38.mp3",
+      "path": "/Users/egor/callcenter-qa-app/.callqa_state/batch_resume_files/0048_19-03-2026_7_904_576-76-92_03-38.mp3",
+      "size": 587360
+    },
+    {
+      "name": "19-03-2026_7 (908) 451-22-84_02-05.mp3",
+      "path": "/Users/egor/callcenter-qa-app/.callqa_state/batch_resume_files/0049_19-03-2026_7_908_451-22-84_02-05.mp3",
+      "size": 1097876
+    },
+    {
+      "name": "19-03-2026_7 (908) 978-50-05_02-07.mp3",
+      "path": "/Users/egor/callcenter-qa-app/.callqa_state/batch_resume_files/0050_19-03-2026_7_908_978-50-05_02-07.mp3",
+      "size": 598004
+    },
+    {
+      "name": "19-03-2026_7 (914) 028-97-49_02-06.mp3",
+      "path": "/Users/egor/callcenter-qa-app/.callqa_state/batch_resume_files/0051_19-03-2026_7_914_028-97-49_02-06.mp3",
+      "size": 560258
+    },
+    {
+      "name": "19-03-2026_7 (914) 319-00-28_02-05.mp3",
+      "path": "/Users/egor/callcenter-qa-app/.callqa_state/batch_resume_files/0052_19-03-2026_7_914_319-00-28_02-05.mp3",
+      "size": 633764
+    },
+    {
+      "name": "19-03-2026_7 (914) 678-90-58_02-05.mp3",
+      "path": "/Users/egor/callcenter-qa-app/.callqa_state/batch_resume_files/0053_19-03-2026_7_914_678-90-58_02-05.mp3",
+      "size": 682455
+    },
+    {
+      "name": "19-03-2026_7 (914) 715-94-06_02-05.mp3",
+      "path": "/Users/egor/callcenter-qa-app/.callqa_state/batch_resume_files/0054_19-03-2026_7_914_715-94-06_02-05.mp3",
+      "size": 633799
+    },
+    {
+      "name": "19-03-2026_7 (933) 056-13-52_01-48.mp3",
+      "path": "/Users/egor/callcenter-qa-app/.callqa_state/batch_resume_files/0055_19-03-2026_7_933_056-13-52_01-48.mp3",
+      "size": 470180
+    },
+    {
+      "name": "19-03-2026_7 (994) 002-34-29_02-11.mp3",
+      "path": "/Users/egor/callcenter-qa-app/.callqa_state/batch_resume_files/0056_19-03-2026_7_994_002-34-29_02-11.mp3",
+      "size": 764832
+    }
+  ],
+  "collected": [
+    {
+      "original_filename": "06-03-2026_7 (423) 239-30-55_00-55.mp3",
+      "date": "06-03-2026",
+      "operator_name": "Анастасия",
+      "phone": "7 (423) 239-30-55",
+      "applicant_name": "Ещё Раз",
+      "wait_display": "00:55",
+      "total_score": 7,
+      "max_score": 10,
+      "script_score": 6,
+      "speech_score": 8,
+      "consultation_score": 7,
+      "engagement_score": 8,
+      "tone_summary": "Нейтральный",
+      "script_details": [
+        "Приветствие + предложение помочь: да",
+        "Представился по имени: да",
+        "Познакомился с заявителем: нет",
+        "Называл заявителя по имени ≥2 раз: нет (Ещё Раз) [оп.0/всего1]",
+        "Предложил дополнительную помощь: нет",
+        "Поблагодарил за обращение: да",
+        "Персонализированное прощание: да"
+      ],
+      "positives": [
+        "Оператор представился и назвал своё имя",
+        "Оператор предоставил корректную информацию по вопросу заявителя",
+        "Оператор вежливо попрощался и пожелал хорошего дня"
+      ],
+      "negatives": [
+        "Не спросил имя заявителя и не обращался по имени — рекомендуется уточнять имя в начале разговора",
+        "Не предложил дополнительную помощь перед прощанием — рекомендуется спрашивать \"Чем ещё могу помочь?\"",
+        "Обращение по имени не выполнено: имя заявителя «Ещё Раз» найдено, но по диалогу нет корректного обращения по имени ≥2 раз.",
+        "Обращение по имени: заявитель определён как «Ещё Раз», но оператор обратился по имени только 0 раз(а). По стандарту ЕКЦ нужно обращаться по имени.",
+        "Некорректные обращения вместо имени: \"девушка\" — если имя известно, обращайтесь к заявителю по имени."
+      ],
+      "review_flag": "Нет"
+    }
+  ],
+  "errors": {},
+  "sheets_log": {
+    "06-03-2026_7 (423) 239-30-55_00-55.mp3": "✅ Добавлено"
+  }
+}

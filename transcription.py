@@ -41,7 +41,7 @@ except Exception:
 
 from app_config import load_app_environment
 from hf_hub_sync import HF_HUB_DOWNLOAD_LOCK, force_huggingface_hub_online
-from operator_staff import OPERATOR_ALIASES
+from operator_staff import OPERATOR_ALIASES, canonicalize_operator_name
 from audio_io_safe import is_probably_compressed_audio, load_audio_mono_16k_safe
 from applicant_name_utils import APPLICANT_NAME_NOISE_WORDS, normalize_applicant_name_candidate
 from role_misattribution_fix import fix_operator_thanks_mislabeled_as_applicant
@@ -2212,7 +2212,6 @@ class Transcriber:
                 transcribe_base_kwargs["prepend_punctuations"] = "\"'\u201c\u00bf([{-\u00ab"
             if "append_punctuations" in _twp:
                 transcribe_base_kwargs["append_punctuations"] = "\"'.。,，!！?？:：\u201d)]}、\u00bb"
-        clip_applied = False
         skip_sec = 0.0
         file_skip_extra = ""
         if self.skip_first_seconds is not None:
@@ -2271,37 +2270,47 @@ class Transcriber:
             if self.asr_profile == "ultima_ru"
             else None
         )
-        prepared_audio = _prepare_asr_normalized_wav(
-            path,
-            skip_sec,
-            transcribe_base_kwargs,
-            self._log,
-            target_active_rms=_norm_target,
-            denoise=_do_denoise,
-            denoise_kwargs=_ultima_denoise_kw,
-        )
+        _tmp_paths_to_cleanup: list[str] = []
+
+        def _prepare_audio_pass(denoise_mode: bool | str) -> tuple[PreparedAsrAudio, dict[str, object]]:
+            prepared = _prepare_asr_normalized_wav(
+                path,
+                skip_sec,
+                transcribe_base_kwargs,
+                self._log,
+                target_active_rms=_norm_target,
+                denoise=denoise_mode,
+                denoise_kwargs=_ultima_denoise_kw,
+            )
+            local_kwargs = dict(prepared.transcribe_kwargs)
+            if prepared.temp_wav_path and prepared.temp_wav_path not in _tmp_paths_to_cleanup:
+                _tmp_paths_to_cleanup.append(prepared.temp_wav_path)
+            if skip_sec > 0 and prepared.temp_wav_path is None and prepared.path == path:
+                signature = inspect.signature(self._model.transcribe)
+                if "clip_timestamps" in signature.parameters:
+                    local_kwargs["clip_timestamps"] = f"{skip_sec}"
+                    self._log(
+                        f"Запасной режим: начало {skip_sec:.1f} с только через clip_timestamps "
+                        f"(временный WAV с обрезкой не создан)."
+                    )
+                else:
+                    self._log(
+                        "Внимание: пропуск начала недоступен — нет clip_timestamps и не удалось собрать WAV."
+                    )
+            return prepared, local_kwargs
+
+        prepared_audio, transcribe_kwargs = _prepare_audio_pass(_do_denoise)
         asr_path = prepared_audio.path
         time_offset = prepared_audio.time_offset
-        transcribe_kwargs = dict(prepared_audio.transcribe_kwargs)
-        _asr_tmp = prepared_audio.temp_wav_path
-        if skip_sec > 0 and _asr_tmp is None and asr_path == path:
-            signature = inspect.signature(self._model.transcribe)
-            if "clip_timestamps" in signature.parameters:
-                transcribe_kwargs["clip_timestamps"] = f"{skip_sec}"
-                clip_applied = True
-                time_offset = 0.0
-                self._log(
-                    f"Запасной режим: начало {skip_sec:.1f} с только через clip_timestamps "
-                    f"(временный WAV с обрезкой не создан)."
-                )
-            else:
-                self._log(
-                    "Внимание: пропуск начала недоступен — нет clip_timestamps и не удалось собрать WAV."
-                )
         fast_ultima = (
             self.asr_profile == "ultima_ru"
             and self._resolve_ultima_acceleration_mode(prepared_audio.prefer_fast_ultima)
         )
+        if self.asr_profile == "ultima_ru" and not fast_ultima and not prepared_audio.denoise_applied:
+            self._log("[asr] Ultima fast-hint отключён; пересобираю WAV с денойзом для полного decode.")
+            prepared_audio, transcribe_kwargs = _prepare_audio_pass(True)
+            asr_path = prepared_audio.path
+            time_offset = prepared_audio.time_offset
         transcribe_kwargs = self._apply_profile_decode_settings(
             transcribe_kwargs,
             fast_ultima=fast_ultima,
@@ -2367,6 +2376,7 @@ class Transcriber:
             *,
             progress_prefix: str,
             emit_progress: bool,
+            decode_started: float,
         ) -> tuple[list[str], list[str], list[tuple[float, float, str]], int, int]:
             local_parts: list[str] = []
             local_chunks: list[str] = []
@@ -2432,125 +2442,224 @@ class Transcriber:
                 local_hallucination_count,
             )
 
-        (
-            parts,
-            chunks,
-            whisper_pieces_rel,
-            segment_count,
-            hallucination_count,
-        ) = _collect_asr_pieces(
-            segments,
-            progress_prefix="ASR прогресс",
-            emit_progress=True,
-        )
+        def _run_whisper_decode_pass(
+            *,
+            asr_audio_path: str,
+            pass_kwargs: dict[str, object],
+            progress_prefix: str,
+            stage_label: str,
+        ) -> dict[str, object]:
+            asr_started_local = time.perf_counter()
+            self._stage(
+                "Whisper",
+                f"{stage_label}: запуск модели, VAD и признаки — на длинных файлах несколько минут",
+            )
+            segments_local, info_local = self._model.transcribe(asr_audio_path, **pass_kwargs)
+            prep_elapsed_local = time.perf_counter() - asr_started_local
+            dur_full_local = float(getattr(info_local, "duration", 0.0) or 0.0)
+            dur_vad_local = float(getattr(info_local, "duration_after_vad", dur_full_local) or dur_full_local)
+            self._stage(
+                "Whisper",
+                f"{stage_label}: признаки за {prep_elapsed_local:.1f} с "
+                f"(аудио {dur_full_local:.1f} с, после VAD ~{dur_vad_local:.1f} с речи); "
+                f"дальше — потоковое декодирование и сбор текста",
+            )
+            decode_started_local = time.perf_counter()
+            (
+                parts_local,
+                chunks_local,
+                whisper_pieces_rel_local,
+                segment_count_local,
+                hallucination_count_local,
+            ) = _collect_asr_pieces(
+                segments_local,
+                progress_prefix=progress_prefix,
+                emit_progress=True,
+                decode_started=decode_started_local,
+            )
 
-        intro_recovery_added = 0
-        intro_recovery_hallucinations = 0
-        try:
-            _transcribe_sig = inspect.signature(self._model.transcribe)
-            _clip_supported = "clip_timestamps" in _transcribe_sig.parameters
-        except Exception:
-            _clip_supported = False
-
-        if _clip_supported and should_attempt_intro_recovery(
-            whisper_pieces_rel,
-            audio_duration=_dur_full,
-            duration_after_vad=_dur_vad,
-        ):
-            intro_limit_sec = 32.0 if self.asr_profile in _PREMIUM_ASR_PROFILES else 28.0
-            rescue_kwargs = dict(transcribe_kwargs)
-            rescue_kwargs["clip_timestamps"] = f"0,{intro_limit_sec:.1f}"
-            rescue_kwargs["vad_filter"] = False
-            rescue_kwargs["condition_on_previous_text"] = False
-            rescue_kwargs["temperature"] = 0.0
-            rescue_kwargs["no_speech_threshold"] = max(
-                float(rescue_kwargs.get("no_speech_threshold", 0.0) or 0.0),
-                0.86 if self.asr_profile == "ultima_ru" else 0.78,
-            )
-            rescue_kwargs["log_prob_threshold"] = min(
-                float(rescue_kwargs.get("log_prob_threshold", -1.0) or -1.0),
-                -1.8,
-            )
-            rescue_kwargs["initial_prompt"] = (
-                f"{_initial_asr_prompt} "
-                "Начало звонка: приветствие оператора, ДВФУ, меня зовут, слушаю вас, "
-                "чем могу помочь, как к вам обращаться."
-            )
-            self._log(
-                f"[asr] Основной проход выглядит обрезанным в начале; запускаю intro rescue "
-                f"до {intro_limit_sec:.0f} с без VAD."
-            )
+            intro_recovery_added_local = 0
+            intro_recovery_hallucinations_local = 0
             try:
-                rescue_segments, _ = self._model.transcribe(asr_path, **rescue_kwargs)
-                (
-                    _rescue_parts,
-                    _rescue_chunks,
-                    rescue_pieces_rel,
-                    _rescue_segment_count,
-                    intro_recovery_hallucinations,
-                ) = _collect_asr_pieces(
-                    rescue_segments,
-                    progress_prefix="ASR intro",
-                    emit_progress=False,
+                _transcribe_sig = inspect.signature(self._model.transcribe)
+                _clip_supported = "clip_timestamps" in _transcribe_sig.parameters
+            except Exception:
+                _clip_supported = False
+
+            if _clip_supported and should_attempt_intro_recovery(
+                whisper_pieces_rel_local,
+                audio_duration=dur_full_local,
+                duration_after_vad=dur_vad_local,
+            ):
+                intro_limit_sec = 32.0 if self.asr_profile in _PREMIUM_ASR_PROFILES else 28.0
+                rescue_kwargs = dict(pass_kwargs)
+                rescue_kwargs["clip_timestamps"] = f"0,{intro_limit_sec:.1f}"
+                rescue_kwargs["vad_filter"] = False
+                rescue_kwargs["condition_on_previous_text"] = False
+                rescue_kwargs["temperature"] = 0.0
+                rescue_kwargs["no_speech_threshold"] = max(
+                    float(rescue_kwargs.get("no_speech_threshold", 0.0) or 0.0),
+                    0.86 if self.asr_profile == "ultima_ru" else 0.78,
                 )
-                del _rescue_parts, _rescue_chunks, _rescue_segment_count
-
-                first_main_start = whisper_pieces_rel[0][0] if whisper_pieces_rel else intro_limit_sec
-                main_head_texts = [piece_text for _s, _e, piece_text in whisper_pieces_rel[:3]]
-                rescue_keep: list[tuple[float, float, str]] = []
-                for rescue_start, rescue_end, rescue_text in rescue_pieces_rel:
-                    if whisper_pieces_rel and rescue_end > (first_main_start + 0.35):
-                        continue
-                    rescue_tokens = self._token_set(rescue_text)
-                    if not rescue_tokens:
-                        continue
-                    duplicate = False
-                    for main_text in main_head_texts:
-                        main_tokens = self._token_set(main_text)
-                        overlap = len(rescue_tokens & main_tokens) / max(
-                            1,
-                            min(len(rescue_tokens), len(main_tokens)),
-                        )
-                        if overlap >= 0.82:
-                            duplicate = True
-                            break
-                    if not duplicate:
-                        rescue_keep.append((rescue_start, rescue_end, rescue_text))
-
-                if rescue_keep:
-                    whisper_pieces_rel = rescue_keep + whisper_pieces_rel
-                    parts = [piece_text for _s, _e, piece_text in whisper_pieces_rel]
-                    chunks = []
-                    for _s, _e, piece_text in whisper_pieces_rel:
-                        chunks.extend(self._split_sentences(piece_text))
-                    intro_recovery_added = len(rescue_keep)
-                    self._log(
-                        f"[asr] Intro rescue добавил {intro_recovery_added} ранних фрагм. "
-                        f"до первого основного сегмента."
+                rescue_kwargs["log_prob_threshold"] = min(
+                    float(rescue_kwargs.get("log_prob_threshold", -1.0) or -1.0),
+                    -1.8,
+                )
+                rescue_kwargs["initial_prompt"] = (
+                    f"{_initial_asr_prompt} "
+                    "Начало звонка: приветствие оператора, ДВФУ, меня зовут, слушаю вас, "
+                    "чем могу помочь, как к вам обращаться."
+                )
+                self._log(
+                    f"[asr] {stage_label}: основной проход выглядит обрезанным в начале; "
+                    f"запускаю intro rescue до {intro_limit_sec:.0f} с без VAD."
+                )
+                try:
+                    rescue_segments, _ = self._model.transcribe(asr_audio_path, **rescue_kwargs)
+                    (
+                        _rescue_parts,
+                        _rescue_chunks,
+                        rescue_pieces_rel,
+                        _rescue_segment_count,
+                        intro_recovery_hallucinations_local,
+                    ) = _collect_asr_pieces(
+                        rescue_segments,
+                        progress_prefix=f"{progress_prefix} intro",
+                        emit_progress=False,
+                        decode_started=decode_started_local,
                     )
-                else:
-                    self._log("[asr] Intro rescue не дал новых уникальных ранних фрагментов.")
-            except Exception as exc:
-                self._log(f"[asr] Intro rescue пропущен ({type(exc).__name__}: {exc})")
+                    del _rescue_parts, _rescue_chunks, _rescue_segment_count
 
-        decode_elapsed = time.perf_counter() - decode_started
-        asr_elapsed = time.perf_counter() - asr_started
-        text = " ".join(parts).strip()
-        total_hallucinations = hallucination_count + intro_recovery_hallucinations
-        self._stage(
-            "текст",
-            f"распознавание завершено: сегментов Whisper={segment_count}, символов ≈{len(text)}, "
-            f"фрагментов с таймкодами={len(whisper_pieces_rel)}; "
-            f"декод {decode_elapsed:.1f} с, всего ASR {asr_elapsed:.1f} с"
-            + (f"; intro_rescue=+{intro_recovery_added}" if intro_recovery_added else "")
-            + (
-                f"; галлюцинаций отброшено: {total_hallucinations}"
-                if total_hallucinations
-                else ""
-            ),
+                    first_main_start = (
+                        whisper_pieces_rel_local[0][0] if whisper_pieces_rel_local else intro_limit_sec
+                    )
+                    main_head_texts = [piece_text for _s, _e, piece_text in whisper_pieces_rel_local[:3]]
+                    rescue_keep: list[tuple[float, float, str]] = []
+                    for rescue_start, rescue_end, rescue_text in rescue_pieces_rel:
+                        if whisper_pieces_rel_local and rescue_end > (first_main_start + 0.35):
+                            continue
+                        rescue_tokens = self._token_set(rescue_text)
+                        if not rescue_tokens:
+                            continue
+                        duplicate = False
+                        for main_text in main_head_texts:
+                            main_tokens = self._token_set(main_text)
+                            overlap = len(rescue_tokens & main_tokens) / max(
+                                1,
+                                min(len(rescue_tokens), len(main_tokens)),
+                            )
+                            if overlap >= 0.82:
+                                duplicate = True
+                                break
+                        if not duplicate:
+                            rescue_keep.append((rescue_start, rescue_end, rescue_text))
+
+                    if rescue_keep:
+                        whisper_pieces_rel_local = rescue_keep + whisper_pieces_rel_local
+                        parts_local = [piece_text for _s, _e, piece_text in whisper_pieces_rel_local]
+                        chunks_local = []
+                        for _s, _e, piece_text in whisper_pieces_rel_local:
+                            chunks_local.extend(self._split_sentences(piece_text))
+                        intro_recovery_added_local = len(rescue_keep)
+                        self._log(
+                            f"[asr] {stage_label}: intro rescue добавил {intro_recovery_added_local} "
+                            "ранних фрагм. до первого основного сегмента."
+                        )
+                    else:
+                        self._log(f"[asr] {stage_label}: intro rescue не дал новых уникальных фрагментов.")
+                except Exception as exc:
+                    self._log(f"[asr] {stage_label}: intro rescue пропущен ({type(exc).__name__}: {exc})")
+
+            decode_elapsed_local = time.perf_counter() - decode_started_local
+            asr_elapsed_local = time.perf_counter() - asr_started_local
+            text_local = " ".join(parts_local).strip()
+            total_hallucinations_local = (
+                hallucination_count_local + intro_recovery_hallucinations_local
+            )
+            self._stage(
+                "текст",
+                f"{stage_label}: сегментов Whisper={segment_count_local}, символов ≈{len(text_local)}, "
+                f"фрагментов с таймкодами={len(whisper_pieces_rel_local)}; "
+                f"декод {decode_elapsed_local:.1f} с, всего ASR {asr_elapsed_local:.1f} с"
+                + (
+                    f"; intro_rescue=+{intro_recovery_added_local}"
+                    if intro_recovery_added_local
+                    else ""
+                )
+                + (
+                    f"; галлюцинаций отброшено: {total_hallucinations_local}"
+                    if total_hallucinations_local
+                    else ""
+                ),
+            )
+            return {
+                "text": text_local,
+                "parts": parts_local,
+                "chunks": chunks_local,
+                "pieces": whisper_pieces_rel_local,
+                "segment_count": segment_count_local,
+                "hallucination_count": hallucination_count_local,
+                "intro_recovery_added": intro_recovery_added_local,
+                "intro_recovery_hallucinations": intro_recovery_hallucinations_local,
+                "prep_elapsed": prep_elapsed_local,
+                "decode_elapsed": decode_elapsed_local,
+                "asr_elapsed": asr_elapsed_local,
+                "duration_full": dur_full_local,
+                "duration_after_vad": dur_vad_local,
+                "info": info_local,
+            }
+
+        decode_result = _run_whisper_decode_pass(
+            asr_audio_path=asr_path,
+            pass_kwargs=transcribe_kwargs,
+            progress_prefix="ASR прогресс",
+            stage_label="основной проход",
         )
-        info_language = getattr(info, "language", None)
-        whisper_pieces_rel = [(s + time_offset, e + time_offset, t) for s, e, t in whisper_pieces_rel]
+        if fast_ultima:
+            retry_needed, retry_reason = should_retry_ultima_full_decode(
+                text=str(decode_result["text"]),
+                pieces=list(decode_result["pieces"]),
+                duration_after_vad=float(decode_result["duration_after_vad"]),
+                segment_count=int(decode_result["segment_count"]),
+                hallucination_count=int(decode_result["hallucination_count"]),
+                intro_recovery_added=int(decode_result["intro_recovery_added"]),
+            )
+            if retry_needed:
+                self._log(
+                    f"[asr] Ultima fast-path дал подозрительный результат ({retry_reason}); "
+                    "переключаюсь на полный локальный decode."
+                )
+                if not prepared_audio.denoise_applied:
+                    prepared_audio, retry_base_kwargs = _prepare_audio_pass(True)
+                    asr_path = prepared_audio.path
+                    time_offset = prepared_audio.time_offset
+                else:
+                    retry_base_kwargs = dict(prepared_audio.transcribe_kwargs)
+                transcribe_kwargs = self._apply_profile_decode_settings(
+                    retry_base_kwargs,
+                    fast_ultima=False,
+                )
+                decode_result = _run_whisper_decode_pass(
+                    asr_audio_path=asr_path,
+                    pass_kwargs=transcribe_kwargs,
+                    progress_prefix="ASR retry",
+                    stage_label="повторный полный проход",
+                )
+                fast_ultima = False
+
+        for tmp_path in _tmp_paths_to_cleanup:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+        text = str(decode_result["text"])
+        asr_elapsed = float(decode_result["asr_elapsed"])
+        info_language = getattr(decode_result["info"], "language", None)
+        whisper_pieces_rel = [
+            (s + time_offset, e + time_offset, t)
+            for s, e, t in list(decode_result["pieces"])
+        ]
 
         text = self._postprocess_ru_text(text)
         self._stage("текст", "постобработка русского (нормализация текста) завершена")
@@ -3216,7 +3325,12 @@ class CallQualityEvaluator:
             return ot[-max_chars:].lower()
         return ot.lower()
 
-    def _extract_name_from_applicant_reply(self, text: str) -> str | None:
+    def _extract_name_from_applicant_reply(
+        self,
+        text: str,
+        *,
+        asked_by_operator: bool = False,
+    ) -> str | None:
         """Имя из ответа заявителя после вопроса «как вас зовут» и т.п."""
         raw = text.strip()
         if not raw:
@@ -3233,21 +3347,33 @@ class CallQualityEvaluator:
         for pat in structured:
             m = re.search(pat, low)
             if m:
-                candidate = normalize_applicant_name_candidate(m.group(1), max_words=1)
+                candidate = normalize_applicant_name_candidate(
+                    m.group(1),
+                    max_words=1,
+                    explicit_context=True,
+                )
                 if candidate:
                     return candidate
+
+        if not asked_by_operator:
+            return None
 
         compact = re.sub(r"\s+", " ", low).strip()
         if len(compact) <= 45 and compact.count(" ") <= 4:
             words = re.findall(r"[а-яё]{2,}", compact)
             words = [w for w in words if w not in self._APPLICANT_NAME_STOPWORDS and len(w) >= 3]
             if len(words) == 1:
-                return normalize_applicant_name_candidate(words[0], max_words=1)
+                return normalize_applicant_name_candidate(
+                    words[0],
+                    max_words=1,
+                    explicit_context=False,
+                )
             # «Мирослава Строфская.» — оператор обычно называет по имени; сохраняем оба слова для отчёта
             if len(words) == 2:
                 return normalize_applicant_name_candidate(
                     f"{words[0]} {words[1]}",
                     max_words=2,
+                    explicit_context=True,
                 )
         return None
 
@@ -3269,7 +3395,10 @@ class CallQualityEvaluator:
                 if r2 == "Оператор":
                     break
                 if r2 == "Заявитель":
-                    name = self._extract_name_from_applicant_reply(t2)
+                    name = self._extract_name_from_applicant_reply(
+                        t2,
+                        asked_by_operator=True,
+                    )
                     if name:
                         return name
         for role, text in blocks:
@@ -3280,7 +3409,7 @@ class CallQualityEvaluator:
                 r"меня\s+зовут|зовут\s+меня|это\s+[а-яё]{2,}|имя\s+[а-яё]{2,}", low
             ):
                 continue
-            name = self._extract_name_from_applicant_reply(text)
+            name = self._extract_name_from_applicant_reply(text, asked_by_operator=False)
             if name:
                 return name
         return None
@@ -3328,20 +3457,36 @@ class CallQualityEvaluator:
         ok = op_hits >= 2 or all_hits >= 3
         return ok, op_hits, all_hits
 
-    def _find_applicant_name(self, transcript: str) -> str | None:
-        """Эвристики по тексту (частота / фраза «меня зовут»). Полный role_transcript — в evaluate."""
+    def _find_applicant_name(
+        self,
+        transcript: str,
+        *,
+        operator_text_lower: str = "",
+        applicant_text_lower: str = "",
+        operator_name: str | None = None,
+    ) -> str | None:
+        """Осторожный fallback: берём только имя, которое реально поддержано диалогом."""
         if not (transcript or "").strip():
             return None
         text = transcript.lower()
+        operator_canonical = canonicalize_operator_name(operator_name)
 
         for name in self._COMMON_NAMES:
-            hits = len(re.findall(rf"\b{re.escape(name)}\b", text))
-            if hits >= 2:
-                return normalize_applicant_name_candidate(name, max_words=1)
-            if hits == 1 and len(name) >= 4:
-                # Редкие имена чаще уникальны в реплике заявителя
-                if re.search(rf"(меня\s+зовут|зовут\s+меня|это\s+){re.escape(name)}\b", text):
-                    return normalize_applicant_name_candidate(name, max_words=1)
+            candidate = normalize_applicant_name_candidate(name, max_words=1)
+            if not candidate:
+                continue
+            if operator_canonical and candidate == operator_canonical:
+                continue
+            op_hits = self._count_applicant_name_token_in_text(operator_text_lower, candidate)
+            dialog_hits = self._count_applicant_name_token_in_text(text, candidate)
+            if op_hits >= 2 or dialog_hits >= 3:
+                return candidate
+            if re.search(rf"(меня\s+зовут|зовут\s+меня|это\s+){re.escape(name)}\b", text):
+                return normalize_applicant_name_candidate(
+                    name,
+                    max_words=1,
+                    explicit_context=True,
+                )
         return None
 
     def evaluate(
@@ -3365,8 +3510,16 @@ class CallQualityEvaluator:
         if not applicant_name:
             applicant_name = self._find_applicant_name_from_dialog(role_transcript)
         if not applicant_name and (applicant_text_raw or "").strip():
-            applicant_name = self._extract_name_from_applicant_reply(applicant_text_raw)
-        applicant_name = applicant_name or self._find_applicant_name(applicant_text_raw or transcript)
+            applicant_name = self._extract_name_from_applicant_reply(
+                applicant_text_raw,
+                asked_by_operator=False,
+            )
+        applicant_name = applicant_name or self._find_applicant_name(
+            applicant_text_raw or transcript,
+            operator_text_lower=operator_text,
+            applicant_text_lower=applicant_text,
+            operator_name=operator_name,
+        )
 
         has_greeting = self._count_pattern_hits(operator_text, self._GREETING_PATTERNS) > 0
         has_intro = self._count_pattern_hits(operator_text, self._INTRO_PATTERNS) > 0

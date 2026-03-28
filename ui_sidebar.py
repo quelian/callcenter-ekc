@@ -240,8 +240,9 @@ def render_sidebar(app_version_label: str, app_version_date: str) -> SidebarStat
             help=(
                 "Стандарт: Whisper Medium, int8; быстро, достаточно для большинства звонков. "
                 "Максимум: Systran Large-v3 + beam 9/best_of 5 + 3 температуры; максимальное качество. "
-                "Ultima: fine-tuned whisper-large-v3-russian; beam 9/best_of 4/patience 1.1 + 3 температуры; "
-                "спектральный денойз (SNR↑ для тихой/шумной речи); "
+                "Ultima: fine-tuned whisper-large-v3-russian; локальный auto fast-path для чистых звонков "
+                "с авто-откатом на полный decode при сомнительном результате; "
+                "спектральный денойз включается адаптивно (SNR↑ для тихой/шумной речи); "
                 "сверхчувствительный VAD pad=2000ms (не режет первые слова); "
                 "no_speech_threshold=0.82, log_prob=-1.2 (декодирует даже тихие вступления); "
                 "плотная диаризация: окна 2.4с/шаг 0.6с, взвешенный vote. На Mac без GPU — int8_float32."
