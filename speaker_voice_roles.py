@@ -1,7 +1,15 @@
 from __future__ import annotations
 
+import math
 from pathlib import Path
+from typing import TYPE_CHECKING, TypeVar
+
 from audio_io_safe import load_audio_mono_16k_safe
+
+if TYPE_CHECKING:
+    import numpy as np
+
+LabelT = TypeVar("LabelT")
 
 
 def _normalize_rows(x):
@@ -60,6 +68,226 @@ def _forced_bipartition_labels(embs):
         labels = np.zeros(n, dtype=int)
         labels[n // 2 :] = 1
     return labels
+
+
+def _merge_adjacent_labeled_spans(
+    spans: list[tuple[float, float, LabelT]],
+    *,
+    max_gap_sec: float = 0.12,
+) -> list[tuple[float, float, LabelT]]:
+    if not spans:
+        return []
+    ordered = sorted(spans, key=lambda item: (item[0], item[1]))
+    merged: list[tuple[float, float, LabelT]] = []
+    for start, end, label in ordered:
+        if end - start <= 1e-6:
+            continue
+        if not merged:
+            merged.append((start, end, label))
+            continue
+        prev_start, prev_end, prev_label = merged[-1]
+        if label == prev_label and start <= prev_end + max_gap_sec:
+            merged[-1] = (prev_start, max(prev_end, end), prev_label)
+        else:
+            merged.append((start, end, label))
+    return merged
+
+
+def _smooth_short_label_islands(
+    spans: list[tuple[float, float, LabelT]],
+    *,
+    min_island_sec: float = 0.45,
+    passes: int = 2,
+    max_gap_sec: float = 0.12,
+) -> list[tuple[float, float, LabelT]]:
+    if len(spans) < 3:
+        return spans
+    current = list(spans)
+    for _ in range(max(1, passes)):
+        changed = False
+        updated = current[:]
+        for i in range(1, len(current) - 1):
+            left = current[i - 1]
+            mid = current[i]
+            right = current[i + 1]
+            mid_dur = mid[1] - mid[0]
+            if mid_dur >= min_island_sec:
+                continue
+            if left[2] == right[2] and mid[2] != left[2]:
+                updated[i] = (mid[0], mid[1], left[2])
+                changed = True
+        current = _merge_adjacent_labeled_spans(updated, max_gap_sec=max_gap_sec)
+        if not changed:
+            break
+    return current
+
+
+def _build_speaker_spans_from_windows(
+    window_times: list[float],
+    labels,
+    window_sec: float,
+    *,
+    max_gap_sec: float = 0.12,
+    min_span_sec: float = 0.45,
+) -> list[tuple[float, float, int]]:
+    import numpy as np
+
+    label_arr = np.asarray(labels, dtype=np.int64).reshape(-1)
+    if not window_times or len(window_times) != len(label_arr):
+        return []
+    if window_sec <= 0:
+        return []
+
+    breakpoints: list[float] = []
+    for start in window_times:
+        breakpoints.append(float(start))
+        breakpoints.append(float(start) + float(window_sec))
+    breakpoints = sorted(set(breakpoints))
+    if len(breakpoints) < 2:
+        return []
+
+    atomic: list[tuple[float, float, int]] = []
+    for idx in range(len(breakpoints) - 1):
+        span_start = breakpoints[idx]
+        span_end = breakpoints[idx + 1]
+        if span_end - span_start <= 0.03:
+            continue
+        votes: dict[int, float] = {}
+        for win_start, label in zip(window_times, label_arr.tolist()):
+            win_end = float(win_start) + float(window_sec)
+            overlap = max(0.0, min(span_end, win_end) - max(span_start, float(win_start)))
+            if overlap > 0.0:
+                votes[int(label)] = votes.get(int(label), 0.0) + overlap
+        if not votes:
+            continue
+        chosen = max(votes, key=lambda key: (votes[key], -key))
+        atomic.append((span_start, span_end, int(chosen)))
+
+    merged = _merge_adjacent_labeled_spans(atomic, max_gap_sec=max_gap_sec)
+    merged = _smooth_short_label_islands(
+        merged,
+        min_island_sec=min_span_sec,
+        max_gap_sec=max_gap_sec,
+    )
+    return [
+        (start, end, int(label))
+        for start, end, label in merged
+        if (end - start) >= 0.08
+    ]
+
+
+def _nearest_speaker_label(
+    mid: float,
+    speaker_spans: list[tuple[float, float, LabelT]],
+) -> LabelT:
+    best_label = speaker_spans[0][2]
+    best_distance = math.inf
+    for span_start, span_end, label in speaker_spans:
+        distance = abs(mid - ((span_start + span_end) * 0.5))
+        if distance < best_distance:
+            best_distance = distance
+            best_label = label
+    return best_label
+
+
+def _split_text_by_duration(
+    text: str,
+    durations: list[float],
+) -> list[str] | None:
+    words = [word for word in str(text).split() if word]
+    if not words or len(durations) < 2:
+        return None
+    if len(words) < len(durations) * 2:
+        return None
+
+    total_words = len(words)
+    total_duration = max(1e-6, sum(max(0.0, value) for value in durations))
+    parts: list[str] = []
+    prev_cut = 0
+    cumulative = 0.0
+    for idx, duration in enumerate(durations[:-1]):
+        cumulative += max(0.0, duration)
+        target_cut = int(round(total_words * (cumulative / total_duration)))
+        min_cut = prev_cut + 1
+        max_cut = total_words - (len(durations) - idx - 1)
+        cut = max(min_cut, min(target_cut, max_cut))
+        parts.append(" ".join(words[prev_cut:cut]).strip())
+        prev_cut = cut
+    parts.append(" ".join(words[prev_cut:]).strip())
+    if any(not part for part in parts):
+        return None
+    return parts
+
+
+def _remap_segments_by_speaker_spans(
+    segments: list[tuple[float, float, str]],
+    speaker_spans: list[tuple[float, float, LabelT]],
+    *,
+    min_split_sec: float = 0.85,
+    min_split_share: float = 0.22,
+    min_words_to_split: int = 6,
+) -> list[tuple[float, float, str, LabelT]]:
+    if not segments or not speaker_spans:
+        return []
+
+    out: list[tuple[float, float, str, LabelT]] = []
+    for seg_start, seg_end, text in segments:
+        seg_s = float(seg_start)
+        seg_e = max(seg_s, float(seg_end))
+        seg_mid = (seg_s + seg_e) * 0.5
+        seg_duration = max(1e-6, seg_e - seg_s)
+
+        overlaps: list[tuple[float, float, LabelT]] = []
+        for span_start, span_end, label in speaker_spans:
+            ov_start = max(seg_s, float(span_start))
+            ov_end = min(seg_e, float(span_end))
+            if ov_end - ov_start >= 0.05:
+                overlaps.append((ov_start, ov_end, label))
+
+        if not overlaps:
+            out.append((seg_s, seg_e, text, _nearest_speaker_label(seg_mid, speaker_spans)))
+            continue
+
+        merged = _merge_adjacent_labeled_spans(overlaps, max_gap_sec=0.05)
+        dominant_by_label: dict[LabelT, float] = {}
+        for ov_start, ov_end, label in merged:
+            dominant_by_label[label] = dominant_by_label.get(label, 0.0) + (ov_end - ov_start)
+        dominant_label = max(dominant_by_label, key=dominant_by_label.get)
+
+        if len(merged) == 1:
+            out.append((seg_s, seg_e, text, dominant_label))
+            continue
+
+        long_groups = [
+            group
+            for group in merged
+            if (group[1] - group[0]) >= min_split_sec
+            and ((group[1] - group[0]) / seg_duration) >= min_split_share
+        ]
+        can_split = (
+            len({group[2] for group in merged}) >= 2
+            and len(merged) <= 3
+            and len(long_groups) >= 2
+            and len(str(text).split()) >= min_words_to_split
+            and seg_duration >= max(1.7, min_split_sec * 1.8)
+        )
+        if not can_split:
+            out.append((seg_s, seg_e, text, dominant_label))
+            continue
+
+        durations = [group[1] - group[0] for group in merged]
+        text_parts = _split_text_by_duration(text, durations)
+        if not text_parts:
+            out.append((seg_s, seg_e, text, dominant_label))
+            continue
+
+        for (piece_start, piece_end, label), piece_text in zip(merged, text_parts):
+            cleaned = piece_text.strip()
+            if not cleaned:
+                continue
+            out.append((piece_start, piece_end, cleaned, label))
+
+    return out
 
 
 def _patch_torchaudio_compat() -> None:
@@ -461,52 +689,34 @@ def cluster_voice_segments(
     labels = fuse_ecapa_resemblyzer_from_windows(vad_window_audio, embs, labels, diagnostics)
 
     # ------------------------------------------------------------------
-    # 5. Маппинг VAD-окон → Whisper-сегменты через временное перекрытие.
-    #
-    # Для каждого Whisper-сегмента находим все VAD-окна, перекрывающиеся
-    # с ним, и берём majority-vote их меток. Это принципиально лучше, чем
-    # старый подход (majority-vote по окнам одного Whisper-сегмента):
-    # теперь несколько Whisper-сегментов могут получить метку от одних и
-    # тех же коротких VAD-окон вместо усреднённых «смешанных» эмбеддингов.
+    # 5. Строим сглаженные speaker-spans из перекрывающихся VAD-окон и
+    #    ремапим Whisper-сегменты на них. Если один Whisper-фрагмент
+    #    перекрывает смену спикера, режем его на 2-3 части пропорционально
+    #    длительности голоса разных кластеров.
     # ------------------------------------------------------------------
-    # Для _nearest_time_label: отсортированный список (mid, label) по VAD-окнам.
-    labeled_times: list[tuple[float, int]] = sorted(
-        ((vad_window_times[i] + window_sec * 0.5, int(labels[i]))
-         for i in range(len(vad_window_times))),
-        key=lambda x: x[0],
+    speaker_spans_raw = _build_speaker_spans_from_windows(
+        vad_window_times,
+        labels,
+        window_sec,
+        max_gap_sec=0.18,
+        min_span_sec=0.45,
     )
-
-    def _nearest_time_label(mid: float) -> int:
-        best_lab = labeled_times[0][1]
-        best_dist = abs(labeled_times[0][0] - mid)
-        for t, lab in labeled_times[1:]:
-            d = abs(t - mid)
-            if d < best_dist:
-                best_dist = d
-                best_lab = lab
-        return best_lab
-
-    out: list[tuple[float, float, str, str]] = []
-    for seg_start, seg_end, txt in segments:
-        seg_s = max(0.0, float(seg_start))
-        seg_e = max(seg_s, float(seg_end))
-        mid = (seg_s + seg_e) * 0.5
-
-        # Взвешенный vote: сумма длин перекрытий для каждого кластера.
-        # Это точнее чем счёт окон: длинное перекрытие = сильнее вес.
-        votes_w: dict[int, float] = {}
-        for win_t, lab in zip(vad_window_times, labels):
-            win_end = win_t + window_sec
-            overlap = max(0.0, min(seg_e, win_end) - max(seg_s, win_t))
-            if overlap >= 0.05:
-                votes_w[int(lab)] = votes_w.get(int(lab), 0.0) + overlap
-
-        if votes_w:
-            assigned = max(votes_w, key=lambda k: votes_w[k])
-        else:
-            assigned = _nearest_time_label(mid)
-
-        out.append((seg_s, seg_e, txt, f"SPK_{assigned}"))
+    diagnostics["speaker_span_count"] = len(speaker_spans_raw)
+    speaker_spans = [
+        (start, end, f"SPK_{int(label)}")
+        for start, end, label in speaker_spans_raw
+    ]
+    out = _remap_segments_by_speaker_spans(
+        segments,
+        speaker_spans,
+        min_split_sec=0.85,
+        min_split_share=0.22,
+        min_words_to_split=6,
+    )
+    diagnostics["split_segments"] = max(0, len(out) - len(segments))
+    if not out:
+        diagnostics["reason"] = "speaker_span_remap_failed"
+        return None, "не удалось сопоставить ASR-сегменты со спикерами", diagnostics
 
     # ------------------------------------------------------------------
     # 6. Сглаживание одиночных перескоков A-B-A на коротких репликах.

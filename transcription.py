@@ -105,6 +105,46 @@ def parse_call_filename_wait_skip(filename: str) -> tuple[float, str] | None:
     return total, tail
 
 
+def should_attempt_intro_recovery(
+    pieces: list[tuple[float, float, str]],
+    *,
+    audio_duration: float,
+    duration_after_vad: float,
+) -> bool:
+    """Нужно ли делать rescue-pass для начала звонка.
+
+    Сигналы проблемы:
+    - первое распознанное слово появляется заметно позже старта;
+    - в первых секундах почти нет слов;
+    - VAD отрезал слишком большую долю файла.
+    """
+    full_dur = max(0.0, float(audio_duration))
+    vad_dur = max(0.0, float(duration_after_vad))
+    if full_dur < 16.0:
+        return False
+    if not pieces:
+        return True
+
+    first_start = max(0.0, float(pieces[0][0]))
+    early_words = 0
+    early_speech = 0.0
+    for start, end, text in pieces:
+        if float(start) >= 12.0:
+            continue
+        early_words += len(str(text).split())
+        early_speech += max(0.0, min(float(end), 12.0) - max(0.0, float(start)))
+
+    if first_start >= 2.8:
+        return True
+    if first_start >= 1.8 and early_words <= 3:
+        return True
+    if early_words <= 2 and early_speech < 1.4 and full_dur >= 22.0:
+        return True
+    if vad_dur < full_dur * 0.16 and full_dur >= 25.0:
+        return True
+    return False
+
+
 # ideal_ru (Максимум) и ultima_ru (Ultima): hotwords для смещения декодера на русскую лексику ЕКЦ и телефонного общения.
 _IDEAL_RU_RU_HOTWORDS = (
     "ДВФУ Владивосток университет деканат институт факультет кафедра студент аспирант абитуриент "
@@ -1673,7 +1713,10 @@ class Transcriber:
         diarization_started = time.perf_counter()
         used_heavy = False
         try:
-            from speaker_voice_roles import cluster_voice_segments
+            from speaker_voice_roles import (
+                _remap_segments_by_speaker_spans,
+                cluster_voice_segments,
+            )
 
             clustered: list[tuple[float, float, str, str]] = []
             cluster_reason = "fallback text"
@@ -1690,10 +1733,18 @@ class Transcriber:
                         max_seconds=self.heavy_diarization_timeout_seconds,
                     )
                     if turns:
-                        clustered = []
-                        for s, e, txt in voice_items:
-                            cid = self._assign_cluster_by_overlap(s, e, turns)
-                            clustered.append((s, e, txt, cid))
+                        clustered = _remap_segments_by_speaker_spans(
+                            voice_items,
+                            turns,
+                            min_split_sec=0.85,
+                            min_split_share=0.22,
+                            min_words_to_split=6,
+                        )
+                        if not clustered:
+                            clustered = []
+                            for s, e, txt in voice_items:
+                                cid = self._assign_cluster_by_overlap(s, e, turns)
+                                clustered.append((s, e, txt, cid))
                         cluster_reason = heavy_reason
                         cluster_diag = heavy_diag
                         used_heavy = True
@@ -2084,68 +2135,194 @@ class Transcriber:
             re.IGNORECASE,
         )
 
-        parts: list[str] = []
-        chunks: list[str] = []
-        whisper_pieces_rel: list[tuple[float, float, str]] = []
-        segment_count = 0
-        hallucination_count = 0
-        for segment in segments:
-            segment_count += 1
-            _now = time.perf_counter()
-            # Обратная связь: декодер отдаёт сегменты лениво — без логов кажется «зависание».
-            if segment_count == 1 or (_now - _last_progress_log) >= 6.0:
-                self._log(
-                    f"ASR прогресс: сегмент #{segment_count}, распознано примерно до {segment.end:.1f} с записи, "
-                    f"декодирование идёт {(_now - decode_started):.1f} с"
-                )
-                _last_progress_log = _now
-            # Ultima: меньший порог паузы → больше подсегментов → точнее диаризация.
-            _min_gap = 0.25 if self.asr_profile == "ultima_ru" else 0.35
-            sub_segs = self._split_segment_at_silences(segment, min_silence_gap=_min_gap)
-            for seg_start, seg_end, piece in sub_segs:
-                if not piece:
-                    continue
-                # IVR автоинформатора: обрезаем только хвост с IVR-фразой,
-                # сохраняя реальную речь оператора/заявителя перед ней.
-                _ivr_m = _IVR_TAIL_RE.search(piece)
-                if _ivr_m:
-                    _before_ivr = piece[:_ivr_m.start()].rstrip()
-                    _before_ivr = re.sub(
-                        r"\s*пожалуйста\s*,?\s*$", "", _before_ivr, flags=re.IGNORECASE
-                    ).rstrip()
-                    if _before_ivr and len(_before_ivr.split()) >= 2:
-                        piece = _before_ivr
-                        self._log(
-                            f"[asr] Обрезан хвост автоинформатора, сохранена речь: «{piece[:80]}»"
-                        )
-                    else:
-                        self._log(
-                            f"[asr] Отброшен сегмент автоинформатора: «{piece[:80]}»"
-                        )
-                        continue
-                if (
-                    len(_prompt_words) >= 3
-                    and float(seg_start) >= _hallucination_overlap_ignore_sec
+        _min_gap = 0.25 if self.asr_profile == "ultima_ru" else 0.35
+
+        def _collect_asr_pieces(
+            segments_iter,
+            *,
+            progress_prefix: str,
+            emit_progress: bool,
+        ) -> tuple[list[str], list[str], list[tuple[float, float, str]], int, int]:
+            local_parts: list[str] = []
+            local_chunks: list[str] = []
+            local_pieces: list[tuple[float, float, str]] = []
+            local_segment_count = 0
+            local_hallucination_count = 0
+            local_last_log = decode_started
+
+            for segment in segments_iter:
+                local_segment_count += 1
+                _now = time.perf_counter()
+                if emit_progress and (
+                    local_segment_count == 1 or (_now - local_last_log) >= 6.0
                 ):
-                    seg_words = set(re.sub(r"[^\w\s]", "", piece.lower()).split())
-                    overlap = len(seg_words & _prompt_words) / len(seg_words) if seg_words else 0.0
-                    if overlap > 0.85 and len(seg_words) >= 5:
-                        hallucination_count += 1
-                        self._log(f"[asr] Отброшен сегмент-галлюцинация ({overlap:.0%}): «{piece[:80]}»")
+                    self._log(
+                        f"{progress_prefix}: сегмент #{local_segment_count}, "
+                        f"распознано примерно до {segment.end:.1f} с записи, "
+                        f"декодирование идёт {(_now - decode_started):.1f} с"
+                    )
+                    local_last_log = _now
+
+                sub_segs = self._split_segment_at_silences(segment, min_silence_gap=_min_gap)
+                for seg_start, seg_end, piece in sub_segs:
+                    if not piece:
                         continue
-                parts.append(piece)
-                chunks.extend(self._split_sentences(piece))
-                whisper_pieces_rel.append((seg_start, seg_end, piece))
+                    _ivr_m = _IVR_TAIL_RE.search(piece)
+                    if _ivr_m:
+                        _before_ivr = piece[:_ivr_m.start()].rstrip()
+                        _before_ivr = re.sub(
+                            r"\s*пожалуйста\s*,?\s*$", "", _before_ivr, flags=re.IGNORECASE
+                        ).rstrip()
+                        if _before_ivr and len(_before_ivr.split()) >= 2:
+                            piece = _before_ivr
+                            self._log(
+                                f"[asr] Обрезан хвост автоинформатора, сохранена речь: «{piece[:80]}»"
+                            )
+                        else:
+                            self._log(
+                                f"[asr] Отброшен сегмент автоинформатора: «{piece[:80]}»"
+                            )
+                            continue
+                    if (
+                        len(_prompt_words) >= 3
+                        and float(seg_start) >= _hallucination_overlap_ignore_sec
+                    ):
+                        seg_words = set(re.sub(r"[^\w\s]", "", piece.lower()).split())
+                        overlap = len(seg_words & _prompt_words) / len(seg_words) if seg_words else 0.0
+                        if overlap > 0.85 and len(seg_words) >= 5:
+                            local_hallucination_count += 1
+                            self._log(
+                                f"[asr] Отброшен сегмент-галлюцинация ({overlap:.0%}): «{piece[:80]}»"
+                            )
+                            continue
+                    local_parts.append(piece)
+                    local_chunks.extend(self._split_sentences(piece))
+                    local_pieces.append((seg_start, seg_end, piece))
+
+            return (
+                local_parts,
+                local_chunks,
+                local_pieces,
+                local_segment_count,
+                local_hallucination_count,
+            )
+
+        (
+            parts,
+            chunks,
+            whisper_pieces_rel,
+            segment_count,
+            hallucination_count,
+        ) = _collect_asr_pieces(
+            segments,
+            progress_prefix="ASR прогресс",
+            emit_progress=True,
+        )
+
+        intro_recovery_added = 0
+        intro_recovery_hallucinations = 0
+        try:
+            _transcribe_sig = inspect.signature(self._model.transcribe)
+            _clip_supported = "clip_timestamps" in _transcribe_sig.parameters
+        except Exception:
+            _clip_supported = False
+
+        if _clip_supported and should_attempt_intro_recovery(
+            whisper_pieces_rel,
+            audio_duration=_dur_full,
+            duration_after_vad=_dur_vad,
+        ):
+            intro_limit_sec = 32.0 if self.asr_profile in _PREMIUM_ASR_PROFILES else 28.0
+            rescue_kwargs = dict(transcribe_kwargs)
+            rescue_kwargs["clip_timestamps"] = f"0,{intro_limit_sec:.1f}"
+            rescue_kwargs["vad_filter"] = False
+            rescue_kwargs["condition_on_previous_text"] = False
+            rescue_kwargs["temperature"] = 0.0
+            rescue_kwargs["no_speech_threshold"] = max(
+                float(rescue_kwargs.get("no_speech_threshold", 0.0) or 0.0),
+                0.86 if self.asr_profile == "ultima_ru" else 0.78,
+            )
+            rescue_kwargs["log_prob_threshold"] = min(
+                float(rescue_kwargs.get("log_prob_threshold", -1.0) or -1.0),
+                -1.8,
+            )
+            rescue_kwargs["initial_prompt"] = (
+                f"{_initial_asr_prompt} "
+                "Начало звонка: приветствие оператора, ДВФУ, меня зовут, слушаю вас, "
+                "чем могу помочь, как к вам обращаться."
+            )
+            self._log(
+                f"[asr] Основной проход выглядит обрезанным в начале; запускаю intro rescue "
+                f"до {intro_limit_sec:.0f} с без VAD."
+            )
+            try:
+                rescue_segments, _ = self._model.transcribe(asr_path, **rescue_kwargs)
+                (
+                    _rescue_parts,
+                    _rescue_chunks,
+                    rescue_pieces_rel,
+                    _rescue_segment_count,
+                    intro_recovery_hallucinations,
+                ) = _collect_asr_pieces(
+                    rescue_segments,
+                    progress_prefix="ASR intro",
+                    emit_progress=False,
+                )
+                del _rescue_parts, _rescue_chunks, _rescue_segment_count
+
+                first_main_start = whisper_pieces_rel[0][0] if whisper_pieces_rel else intro_limit_sec
+                main_head_texts = [piece_text for _s, _e, piece_text in whisper_pieces_rel[:3]]
+                rescue_keep: list[tuple[float, float, str]] = []
+                for rescue_start, rescue_end, rescue_text in rescue_pieces_rel:
+                    if whisper_pieces_rel and rescue_end > (first_main_start + 0.35):
+                        continue
+                    rescue_tokens = self._token_set(rescue_text)
+                    if not rescue_tokens:
+                        continue
+                    duplicate = False
+                    for main_text in main_head_texts:
+                        main_tokens = self._token_set(main_text)
+                        overlap = len(rescue_tokens & main_tokens) / max(
+                            1,
+                            min(len(rescue_tokens), len(main_tokens)),
+                        )
+                        if overlap >= 0.82:
+                            duplicate = True
+                            break
+                    if not duplicate:
+                        rescue_keep.append((rescue_start, rescue_end, rescue_text))
+
+                if rescue_keep:
+                    whisper_pieces_rel = rescue_keep + whisper_pieces_rel
+                    parts = [piece_text for _s, _e, piece_text in whisper_pieces_rel]
+                    chunks = []
+                    for _s, _e, piece_text in whisper_pieces_rel:
+                        chunks.extend(self._split_sentences(piece_text))
+                    intro_recovery_added = len(rescue_keep)
+                    self._log(
+                        f"[asr] Intro rescue добавил {intro_recovery_added} ранних фрагм. "
+                        f"до первого основного сегмента."
+                    )
+                else:
+                    self._log("[asr] Intro rescue не дал новых уникальных ранних фрагментов.")
+            except Exception as exc:
+                self._log(f"[asr] Intro rescue пропущен ({type(exc).__name__}: {exc})")
+
         decode_elapsed = time.perf_counter() - decode_started
         asr_elapsed = time.perf_counter() - asr_started
         text = " ".join(parts).strip()
+        total_hallucinations = hallucination_count + intro_recovery_hallucinations
         self._stage(
             "текст",
             f"распознавание завершено: сегментов Whisper={segment_count}, символов ≈{len(text)}, "
             f"фрагментов с таймкодами={len(whisper_pieces_rel)}; "
             f"декод {decode_elapsed:.1f} с, всего ASR {asr_elapsed:.1f} с"
-            + ""
-            + (f"; галлюцинаций отброшено: {hallucination_count}" if hallucination_count else ""),
+            + (f"; intro_rescue=+{intro_recovery_added}" if intro_recovery_added else "")
+            + (
+                f"; галлюцинаций отброшено: {total_hallucinations}"
+                if total_hallucinations
+                else ""
+            ),
         )
         info_language = getattr(info, "language", None)
         whisper_pieces_rel = [(s + time_offset, e + time_offset, t) for s, e, t in whisper_pieces_rel]

@@ -89,7 +89,12 @@ def run_heavy_diarization(
 
     # Используем кешированную ECAPA-модель (MPS на M1, иначе CPU) вместо загрузки новой.
     try:
-        from speaker_voice_roles import _load_ecapa_model, _embed_windows_ecapa, _normalize_rows
+        from speaker_voice_roles import (
+            _build_speaker_spans_from_windows,
+            _embed_windows_ecapa,
+            _load_ecapa_model,
+            _normalize_rows,
+        )
         model = _load_ecapa_model()
     except Exception as exc:
         return [], f"не удалось загрузить heavy speaker model: {exc}", diagnostics
@@ -208,18 +213,30 @@ def run_heavy_diarization(
     # Временно̀е сглаживание: убираем короткие «острова» не того кластера.
     labels = _temporal_smooth_labels(np.asarray(labels, dtype=np.int32), chunks, min_island_sec=0.5)
 
-    # Взвешенное голосование: более длинные окна получают больший вес.
-    # Это точнее чем simple majority при разной длине окон.
-    votes_w: dict[int, dict[int, float]] = defaultdict(lambda: defaultdict(float))
-    for ch, label in zip(chunks, labels.tolist()):
-        votes_w[ch.parent_idx][int(label)] += ch.duration
+    window_starts = [ch.start for ch in chunks]
+    speaker_spans = _build_speaker_spans_from_windows(
+        window_starts,
+        labels,
+        WIN_SEC,
+        max_gap_sec=0.18,
+        min_span_sec=0.50,
+    )
+    diagnostics["speaker_span_count"] = len(speaker_spans)
+    turns: list[tuple[float, float, str]] = [
+        (start, end, f"SPK_{int(label)}")
+        for start, end, label in speaker_spans
+    ]
 
-    turns: list[tuple[float, float, str]] = []
-    for idx, (s, e) in enumerate(merged):
-        if idx not in votes_w:
-            continue
-        label = max(votes_w[idx], key=lambda k: votes_w[idx][k])
-        turns.append((s, e, f"SPK_{label}"))
+    if not turns:
+        # Fallback: взвешенное голосование по исходным merged-регионам.
+        votes_w: dict[int, dict[int, float]] = defaultdict(lambda: defaultdict(float))
+        for ch, label in zip(chunks, labels.tolist()):
+            votes_w[ch.parent_idx][int(label)] += ch.duration
+        for idx, (s, e) in enumerate(merged):
+            if idx not in votes_w:
+                continue
+            label = max(votes_w[idx], key=lambda k: votes_w[idx][k])
+            turns.append((s, e, f"SPK_{label}"))
     if len(turns) < 2:
         diagnostics["elapsed_seconds"] = round(time.perf_counter() - started, 3)
         return [], "heavy diarization вернула слишком мало сегментов", diagnostics
