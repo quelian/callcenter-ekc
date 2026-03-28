@@ -122,7 +122,7 @@ python transcription.py /path/to/call.wav --asr-profile medium_ru --enable-post-
 
 После ответа модели пункт чек-листа **«Называл заявителя по имени ≥2 раз»** уточняется **по тексту** (подсчёт в репликах оператора, как в локальном `CallQualityEvaluator`); пересчитываются **script_score** и **итоговый балл**, если значение изменилось.
 
-По умолчанию в UI — **YandexGPT Lite** (`yandexgpt-lite`). Доступен также **Pro** (`yandexgpt/latest`) — выбор в сайдбаре.
+По умолчанию в UI — **YandexGPT Lite** (`yandexgpt-lite`). Также доступны **Pro** (`yandexgpt/latest`) и **DeepSeek V3.2** (`deepseek-v32/latest`) — все три варианта работают через тот же API-ключ Yandex AI Studio и выбираются в сайдбаре.
 
 **Настройка:**
 
@@ -134,6 +134,8 @@ python transcription.py /path/to/call.wav --asr-profile medium_ru --enable-post-
 YANDEX_API_KEY=AQVNw...
 YANDEX_FOLDER_ID=b1g...
 YANDEX_CLOUD_MODEL=yandexgpt-lite
+# YANDEX_CLOUD_MODEL=yandexgpt/latest
+# YANDEX_CLOUD_MODEL=deepseek-v32/latest
 ```
 
 При ошибке API оценка автоматически переключается на встроенную эвристику (fallback), звонок не теряется.

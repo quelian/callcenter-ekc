@@ -12,6 +12,18 @@ from transcription import resolve_ultima_whisper_model
 if TYPE_CHECKING:
     from llm_cloud_eval import YandexCloudConfig
 
+_YANDEX_MODEL_ORDER = (
+    "yandexgpt-lite",
+    "yandexgpt/latest",
+    "deepseek-v32/latest",
+)
+
+_YANDEX_MODEL_LABELS = {
+    "yandexgpt-lite": "YandexGPT Lite (по умолчанию)",
+    "yandexgpt/latest": "YandexGPT Pro",
+    "deepseek-v32/latest": "DeepSeek V3.2",
+}
+
 
 @dataclass(frozen=True)
 class SidebarState:
@@ -168,11 +180,6 @@ def render_sidebar(app_version_label: str, app_version_date: str) -> SidebarStat
         cloud_eval_cfg: YandexCloudConfig | None = None
         yandex_api_key = env_api_key
         yandex_folder_id = env_folder_id
-        yandex_model_order = ("yandexgpt-lite", "yandexgpt/latest")
-        yandex_model_labels = {
-            "yandexgpt-lite": "YandexGPT Lite (по умолчанию)",
-            "yandexgpt/latest": "YandexGPT Pro",
-        }
         # При выключенном AI значение не используется для запросов.
         yandex_timeout = int(app_config.yandex_cloud.timeout_seconds)
 
@@ -189,14 +196,19 @@ def render_sidebar(app_version_label: str, app_version_date: str) -> SidebarStat
                 )
 
             if "yandex_cloud_model_lp" not in st.session_state:
+                st.session_state["yandex_cloud_model_lp"] = app_config.yandex_cloud.model
+            if st.session_state["yandex_cloud_model_lp"] not in _YANDEX_MODEL_ORDER:
                 st.session_state["yandex_cloud_model_lp"] = "yandexgpt-lite"
             yandex_model_key = st.radio(
                 "Модель",
-                options=list(yandex_model_order),
-                format_func=lambda key: yandex_model_labels[key],
+                options=list(_YANDEX_MODEL_ORDER),
+                format_func=lambda key: _YANDEX_MODEL_LABELS[key],
                 horizontal=True,
                 key="yandex_cloud_model_lp",
-                help="Тот же API-ключ Yandex AI Studio. Lite — быстрее; Pro — точнее.",
+                help=(
+                    "Тот же API-ключ Yandex AI Studio. "
+                    "Lite — быстрее; Pro — точнее; DeepSeek V3.2 — отдельная модель через тот же Yandex API."
+                ),
             )
 
             with st.expander("Дополнительно", expanded=False):
