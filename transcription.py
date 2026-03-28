@@ -80,6 +80,27 @@ class QualityEvaluation:
     negatives: list[str]
 
 
+@dataclass(frozen=True)
+class PreparedAudioDiagnostics:
+    duration_seconds: float
+    active_rms: float
+    noise_rms: float
+    speech_ratio: float
+    peak: float
+    compressed_source: bool
+
+
+@dataclass
+class PreparedAsrAudio:
+    path: str
+    time_offset: float
+    transcribe_kwargs: dict[str, object]
+    temp_wav_path: str | None
+    diagnostics: PreparedAudioDiagnostics
+    denoise_applied: bool
+    prefer_fast_ultima: bool
+
+
 # Имя файла: `дата_телефон_MM-SS.ext` — последний блок после `_` это ожидание: минуты-секунды.
 _FILENAME_WAIT_TAIL_RE = re.compile(r"^(\d{2})-(\d{2})$")
 
@@ -145,6 +166,104 @@ def should_attempt_intro_recovery(
     if vad_dur < full_dur * 0.16 and full_dur >= 25.0:
         return True
     return False
+
+
+def analyze_prepared_audio_diagnostics(
+    y: object,
+    *,
+    sample_rate: int,
+    compressed_source: bool,
+) -> PreparedAudioDiagnostics:
+    import numpy as np
+
+    arr = np.asarray(y, dtype=np.float32).reshape(-1)
+    if arr.size == 0:
+        return PreparedAudioDiagnostics(
+            duration_seconds=0.0,
+            active_rms=0.0,
+            noise_rms=0.0,
+            speech_ratio=0.0,
+            peak=0.0,
+            compressed_source=compressed_source,
+        )
+
+    frame_rms, _, _ = _frame_rms_curve(arr, sample_rate=sample_rate)
+    fr = np.asarray(frame_rms, dtype=np.float64)
+    if fr.size == 0:
+        full_rms = float(np.sqrt(np.mean(np.square(arr)) + 1e-18))
+        return PreparedAudioDiagnostics(
+            duration_seconds=float(arr.size) / float(sample_rate),
+            active_rms=full_rms,
+            noise_rms=max(1e-8, full_rms * 0.35),
+            speech_ratio=1.0 if full_rms > 1e-6 else 0.0,
+            peak=float(np.max(np.abs(arr)) + 1e-18),
+            compressed_source=compressed_source,
+        )
+
+    p20 = float(np.percentile(fr, 20))
+    p50 = float(np.percentile(fr, 50))
+    active_rms = _estimate_active_speech_rms(fr)
+    speech_threshold = max(p20 * 2.15, p50 * 0.58, 1e-6)
+    speech_ratio = float(np.mean(fr >= speech_threshold))
+    quiet = fr[fr <= max(p20, 1e-8)]
+    if quiet.size == 0:
+        noise_rms = max(1e-8, p20)
+    else:
+        noise_rms = max(1e-8, float(np.median(quiet)))
+
+    return PreparedAudioDiagnostics(
+        duration_seconds=float(arr.size) / float(sample_rate),
+        active_rms=float(active_rms),
+        noise_rms=noise_rms,
+        speech_ratio=speech_ratio,
+        peak=float(np.max(np.abs(arr)) + 1e-18),
+        compressed_source=compressed_source,
+    )
+
+
+def should_use_fast_ultima_decode(diag: PreparedAudioDiagnostics) -> bool:
+    active = max(1e-8, float(diag.active_rms))
+    noise_ratio = float(diag.noise_rms) / active
+    if float(diag.duration_seconds) < 18.0:
+        return False
+    if active < 0.012:
+        return False
+    if float(diag.speech_ratio) < 0.16:
+        return False
+    if noise_ratio > 0.26:
+        return False
+    if float(diag.peak) >= 0.985 and noise_ratio > 0.2:
+        return False
+    if diag.compressed_source and noise_ratio > 0.22 and float(diag.speech_ratio) < 0.22:
+        return False
+    return True
+
+
+def should_retry_ultima_full_decode(
+    *,
+    text: str,
+    pieces: list[tuple[float, float, str]],
+    duration_after_vad: float,
+    segment_count: int,
+    hallucination_count: int,
+    intro_recovery_added: int,
+) -> tuple[bool, str]:
+    words = re.findall(r"[а-яёa-z0-9]+", (text or "").lower())
+    word_count = len(words)
+    dur_vad = max(0.0, float(duration_after_vad))
+    words_per_vad_second = word_count / max(dur_vad, 1.0)
+
+    if not pieces or word_count < 8:
+        return True, "empty_or_too_short"
+    if hallucination_count >= 2:
+        return True, "hallucination_guard"
+    if dur_vad >= 20.0 and words_per_vad_second < 0.78:
+        return True, "too_sparse_for_vad_span"
+    if dur_vad >= 45.0 and segment_count <= 2:
+        return True, "too_few_segments"
+    if intro_recovery_added > 0 and words_per_vad_second < 1.0:
+        return True, "intro_still_sparse"
+    return False, ""
 
 
 # ideal_ru (Максимум) и ultima_ru (Ultima): hotwords для смещения декодера на русскую лексику ЕКЦ и телефонного общения.
@@ -405,9 +524,9 @@ def _prepare_asr_normalized_wav(
     log: Callable[[str], None],
     *,
     target_active_rms: float = 0.11,
-    denoise: bool = False,
+    denoise: bool | str = False,
     denoise_kwargs: dict[str, object] | None = None,
-) -> tuple[str, float, dict[str, object], str | None]:
+) -> PreparedAsrAudio:
     """16 kHz mono WAV для Whisper: обрезка ожидания + опциональный **pre-roll** (см. docs/ASR_START_ANALYSIS.md).
 
     При ``skip_seconds > 0`` грузим с ``offset = skip - pre_roll`` (хвост ожидания перед точкой разреза).
@@ -422,7 +541,23 @@ def _prepare_asr_normalized_wav(
         import soundfile as sf
     except Exception as exc:
         log(f"Подготовка ASR WAV пропущена (нет numpy/soundfile: {exc}).")
-        return source_path, 0.0, transcribe_kwargs, None
+        empty_diag = PreparedAudioDiagnostics(
+            duration_seconds=0.0,
+            active_rms=0.0,
+            noise_rms=0.0,
+            speech_ratio=0.0,
+            peak=0.0,
+            compressed_source=is_probably_compressed_audio(source_path),
+        )
+        return PreparedAsrAudio(
+            path=source_path,
+            time_offset=0.0,
+            transcribe_kwargs=transcribe_kwargs,
+            temp_wav_path=None,
+            diagnostics=empty_diag,
+            denoise_applied=False,
+            prefer_fast_ultima=False,
+        )
 
     off = max(0.0, float(skip_seconds))
     try:
@@ -445,7 +580,23 @@ def _prepare_asr_normalized_wav(
                 "Не удалось декодировать сжатое аудио для ASR (нужен рабочий ffmpeg). "
                 f"Исходная ошибка: {exc}"
             ) from exc
-        return source_path, 0.0, transcribe_kwargs, None
+        empty_diag = PreparedAudioDiagnostics(
+            duration_seconds=0.0,
+            active_rms=0.0,
+            noise_rms=0.0,
+            speech_ratio=0.0,
+            peak=0.0,
+            compressed_source=False,
+        )
+        return PreparedAsrAudio(
+            path=source_path,
+            time_offset=0.0,
+            transcribe_kwargs=transcribe_kwargs,
+            temp_wav_path=None,
+            diagnostics=empty_diag,
+            denoise_applied=False,
+            prefer_fast_ultima=False,
+        )
 
     y = np.asarray(y, dtype=np.float32)
     if y.size == 0:
@@ -456,7 +607,23 @@ def _prepare_asr_normalized_wav(
             raise RuntimeError(
                 "После обрезки по ожиданию сжатое аудио пустое — уменьшите время ожидания или проверьте файл."
             )
-        return source_path, 0.0, transcribe_kwargs, None
+        empty_diag = PreparedAudioDiagnostics(
+            duration_seconds=0.0,
+            active_rms=0.0,
+            noise_rms=0.0,
+            speech_ratio=0.0,
+            peak=0.0,
+            compressed_source=False,
+        )
+        return PreparedAsrAudio(
+            path=source_path,
+            time_offset=0.0,
+            transcribe_kwargs=transcribe_kwargs,
+            temp_wav_path=None,
+            diagnostics=empty_diag,
+            denoise_applied=False,
+            prefer_fast_ultima=False,
+        )
 
     if off > 0 and pre_roll > 0:
         log(
@@ -465,8 +632,20 @@ def _prepare_asr_normalized_wav(
             f"time_offset={load_offset:.2f} с. Отключить: CALLQA_ASR_PRE_ROLL_SECONDS=0"
         )
 
+    compressed_source = is_probably_compressed_audio(source_path)
+    audio_diag = analyze_prepared_audio_diagnostics(
+        y,
+        sample_rate=int(sr),
+        compressed_source=compressed_source,
+    )
+    prefer_fast_ultima = should_use_fast_ultima_decode(audio_diag)
+    denoise_mode = str(denoise).strip().lower()
+    denoise_applied = bool(denoise)
+    if denoise_mode in {"auto_ultima", "auto"}:
+        denoise_applied = not prefer_fast_ultima
+
     # Спектральный денойз (только когда запрошен, напр. Ultima): улучшает SNR для тихой/шумной речи.
-    if denoise:
+    if denoise_applied:
         dk = denoise_kwargs or {}
         y = _spectral_denoise_audio(y, int(sr), log=log, **dk)
 
@@ -493,10 +672,26 @@ def _prepare_asr_normalized_wav(
         except OSError:
             pass
         log(f"Подготовка ASR: запись временного WAV не удалась ({exc}).")
-        return source_path, 0.0, transcribe_kwargs, None
+        return PreparedAsrAudio(
+            path=source_path,
+            time_offset=0.0,
+            transcribe_kwargs=transcribe_kwargs,
+            temp_wav_path=None,
+            diagnostics=audio_diag,
+            denoise_applied=denoise_applied,
+            prefer_fast_ultima=prefer_fast_ultima,
+        )
 
     kw = dict(transcribe_kwargs)
     kw.pop("clip_timestamps", None)
+    noise_ratio = float(audio_diag.noise_rms) / max(1e-8, float(audio_diag.active_rms))
+    log(
+        "ASR audio probe: "
+        f"speech_ratio~{audio_diag.speech_ratio:.2f}, active_rms~{audio_diag.active_rms:.5f}, "
+        f"noise_ratio~{noise_ratio:.2f}, peak~{audio_diag.peak:.3f}, "
+        f"ultima_fast_hint={'yes' if prefer_fast_ultima else 'no'}, "
+        f"denoise={'on' if denoise_applied else 'off'}."
+    )
     if off > 0:
         log(
             f"Для ASR: ожидание по метке {off:.1f} с; фактическая загрузка с {load_offset:.2f} с, "
@@ -507,7 +702,15 @@ def _prepare_asr_normalized_wav(
             f"Аудио для ASR без обрезки ожидания: {len(y_n) / float(sr):.1f} с "
             f"(RMS до/после норм. ~{after_trim_rms:.4f} / ~{after_norm_rms:.4f})."
         )
-    return tmp, load_offset, kw, tmp
+    return PreparedAsrAudio(
+        path=tmp,
+        time_offset=load_offset,
+        transcribe_kwargs=kw,
+        temp_wav_path=tmp,
+        diagnostics=audio_diag,
+        denoise_applied=denoise_applied,
+        prefer_fast_ultima=prefer_fast_ultima,
+    )
 
 
 class Transcriber:
@@ -629,8 +832,10 @@ class Transcriber:
             return "medium"
         return "medium"
 
-    def _asr_decode_preset(self) -> dict[str, object]:
+    def _asr_decode_preset(self, *, fast_ultima: bool = False) -> dict[str, object]:
         if self.asr_profile == "ultima_ru":
+            if fast_ultima:
+                return {"beam_size": 8, "best_of": 4, "patience": 1.02}
             # RU fine-tuned: чуть глубже поиск, чем раньше — модель устойчивее к beam>9, чем «сырой» large-v3.
             return {"beam_size": 10, "best_of": 5, "patience": 1.18}
         if self.asr_profile == "ideal_ru":
@@ -638,6 +843,60 @@ class Transcriber:
             return {"beam_size": 9, "best_of": 5, "patience": 1.12}
         # medium_ru: лёгкий пресет для скорости.
         return {"beam_size": 5, "best_of": 3, "patience": 0.9}
+
+    @staticmethod
+    def _resolve_ultima_acceleration_mode(prefer_fast: bool) -> bool:
+        raw = os.environ.get("CALLQA_ULTIMA_ACCELERATION", "auto").strip().lower()
+        if raw in {"0", "false", "no", "off", "full"}:
+            return False
+        if raw in {"1", "true", "yes", "on", "fast"}:
+            return True
+        return prefer_fast
+
+    def _apply_profile_decode_settings(
+        self,
+        kwargs: dict[str, object],
+        *,
+        fast_ultima: bool = False,
+    ) -> dict[str, object]:
+        out = dict(kwargs)
+        out.update(self._asr_decode_preset(fast_ultima=fast_ultima))
+        if self.asr_profile == "ideal_ru":
+            out.update(
+                {
+                    "temperature": (0.0, 0.4, 0.8),
+                    "compression_ratio_threshold": 2.4,
+                    "log_prob_threshold": -1.0,
+                    "no_speech_threshold": 0.62,
+                }
+            )
+        elif self.asr_profile == "ultima_ru":
+            if fast_ultima:
+                out.update(
+                    {
+                        "temperature": (0.0, 0.25, 0.5),
+                        "compression_ratio_threshold": 2.58,
+                        "log_prob_threshold": -1.18,
+                        "no_speech_threshold": 0.74,
+                    }
+                )
+            else:
+                out.update(
+                    {
+                        "temperature": (0.0, 0.25, 0.5, 0.72),
+                        "compression_ratio_threshold": 2.62,
+                        "log_prob_threshold": -1.32,
+                        "no_speech_threshold": 0.78,
+                    }
+                )
+        else:
+            out.update(
+                {
+                    "no_speech_threshold": 0.56,
+                    "log_prob_threshold": -1.42,
+                }
+            )
+        return out
 
     def _log(self, message: str) -> None:
         print(f"[transcriber] {message}", flush=True)
@@ -1910,54 +2169,20 @@ class Transcriber:
             _initial_asr_prompt += (
                 " Телефонная линия, шум и компрессия; речь может быть тихой или с обрывами слогов."
             )
-        transcribe_kwargs = {
+        transcribe_base_kwargs = {
             "vad_filter": True,
             "vad_parameters": _vad_for_profile,
-            "beam_size": 7,
-            "best_of": 5,
-            # medium_ru: одна температура (быстрее). premium-профили ниже — цепочка fallback.
-            "temperature": 0.0,
             "language": "ru",
             "task": "transcribe",
             "condition_on_previous_text": False,
             # Русский контекст ЕКЦ + разговорные клише линии (якорь для large-v3).
             "initial_prompt": _initial_asr_prompt,
         }
-        transcribe_kwargs.update(self._asr_decode_preset())
         if os.environ.get("CALLQA_ASR_NO_VAD", "").strip().lower() in ("1", "true", "yes"):
-            transcribe_kwargs["vad_filter"] = False
+            transcribe_base_kwargs["vad_filter"] = False
             self._stage(
                 "ASR",
                 "VAD Silero отключён (CALLQA_ASR_NO_VAD=1) — медленнее, но начало разговора не режется VAD",
-            )
-        if self.asr_profile == "ideal_ru":
-            # 3-шаговая цепочка: Systran large-v3 без RU fine-tune — нужны резервные проходы, но не все 6.
-            transcribe_kwargs.update(
-                {
-                    "temperature": (0.0, 0.4, 0.8),
-                    "compression_ratio_threshold": 2.4,
-                    "log_prob_threshold": -1.0,
-                    "no_speech_threshold": 0.62,
-                }
-            )
-        elif self.asr_profile == "ultima_ru":
-            # 4-шаговая цепочка: fine-tuned RU переживает лишний проход лучше, чем «сырой» large-v3.
-            # Чуть мягче отсев по log_prob/compression — меньше пустых дыр на тихой речи и шумной линии.
-            transcribe_kwargs.update(
-                {
-                    "temperature": (0.0, 0.25, 0.5, 0.72),
-                    "compression_ratio_threshold": 2.62,
-                    "log_prob_threshold": -1.32,
-                    "no_speech_threshold": 0.78,
-                }
-            )
-        else:
-            # medium_ru: первое окно Whisper (до 30 с) при дефолтном no_speech может «прыгнуть» вперёд.
-            transcribe_kwargs.update(
-                {
-                    "no_speech_threshold": 0.56,
-                    "log_prob_threshold": -1.42,
-                }
             )
         # Enable word-level timestamps for sub-segment splitting at silence gaps.
         # Checked at runtime so the code works with older faster-whisper versions too.
@@ -1969,41 +2194,24 @@ class Transcriber:
             _wts_default = "0" if self.asr_profile == "medium_ru" else "1"
             _wts_env = os.environ.get("CALLQA_ASR_WORD_TIMESTAMPS", _wts_default).strip().lower()
             if _wts_env in ("0", "false", "no", "off"):
-                transcribe_kwargs["word_timestamps"] = False
+                transcribe_base_kwargs["word_timestamps"] = False
             else:
-                transcribe_kwargs["word_timestamps"] = True
+                transcribe_base_kwargs["word_timestamps"] = True
 
         if self.asr_profile in _PREMIUM_ASR_PROFILES:
             _tw_sig = inspect.signature(self._model.transcribe)
             _twp = _tw_sig.parameters
             if "hotwords" in _twp:
-                transcribe_kwargs["hotwords"] = _IDEAL_RU_RU_HOTWORDS
+                transcribe_base_kwargs["hotwords"] = _IDEAL_RU_RU_HOTWORDS
                 if self.asr_profile == "ultima_ru":
-                    transcribe_kwargs["hotwords"] = (
-                        f"{transcribe_kwargs['hotwords']} {_ULTIMA_RU_HOTWORDS_EXTRA}"
+                    transcribe_base_kwargs["hotwords"] = (
+                        f"{transcribe_base_kwargs['hotwords']} {_ULTIMA_RU_HOTWORDS_EXTRA}"
                     )
             # Кавычки «» для слияния с токенами при word_timestamps.
             if "prepend_punctuations" in _twp:
-                transcribe_kwargs["prepend_punctuations"] = "\"'\u201c\u00bf([{-\u00ab"
+                transcribe_base_kwargs["prepend_punctuations"] = "\"'\u201c\u00bf([{-\u00ab"
             if "append_punctuations" in _twp:
-                transcribe_kwargs["append_punctuations"] = "\"'.。,，!！?？:：\u201d)]}、\u00bb"
-
-        _wts_log = (
-            "off (API не поддерживает)"
-            if not _word_ts_enabled
-            else (
-                "on"
-                if transcribe_kwargs.get("word_timestamps")
-                else "off (ускорение, CALLQA_ASR_WORD_TIMESTAMPS=0)"
-            )
-        )
-        self._stage(
-            "ASR-параметры",
-            f"profile={self.asr_profile}, beam={transcribe_kwargs['beam_size']}, "
-            f"best_of={transcribe_kwargs['best_of']}, patience={transcribe_kwargs.get('patience', 'n/a')}, "
-            f"word_timestamps={_wts_log}"
-            + (", ru_hotwords=on" if transcribe_kwargs.get("hotwords") else ""),
-        )
+                transcribe_base_kwargs["append_punctuations"] = "\"'.。,，!！?？:：\u201d)]}、\u00bb"
         clip_applied = False
         skip_sec = 0.0
         file_skip_extra = ""
@@ -2054,20 +2262,28 @@ class Transcriber:
         )
         # Пропуск ожидания: по возможности физическая обрезка во временном WAV (см. _prepare_asr_normalized_wav),
         # а не clip_timestamps. clip — только запасной вариант, если WAV не создать.
-        # Ultima: агрессивнее нормализуем + спектральный денойз (параметры под телефон/ЕКЦ).
+        # Ultima: сначала оцениваем сигнал; на чистых звонках идём по fast-path без денойза,
+        # на сложных автоматически остаёмся на полном режиме с денойзом.
         _norm_target = 0.135 if self.asr_profile == "ultima_ru" else 0.11
-        _do_denoise = self.asr_profile == "ultima_ru"
+        _do_denoise: bool | str = "auto_ultima" if self.asr_profile == "ultima_ru" else False
         _ultima_denoise_kw: dict[str, object] | None = (
             {"noise_percentile": 10.0, "over_subtraction": 2.28, "spectral_floor": 0.038}
-            if _do_denoise
+            if self.asr_profile == "ultima_ru"
             else None
         )
-        asr_path, time_offset, transcribe_kwargs, _asr_tmp = _prepare_asr_normalized_wav(
-            path, skip_sec, transcribe_kwargs, self._log,
+        prepared_audio = _prepare_asr_normalized_wav(
+            path,
+            skip_sec,
+            transcribe_base_kwargs,
+            self._log,
             target_active_rms=_norm_target,
             denoise=_do_denoise,
             denoise_kwargs=_ultima_denoise_kw,
         )
+        asr_path = prepared_audio.path
+        time_offset = prepared_audio.time_offset
+        transcribe_kwargs = dict(prepared_audio.transcribe_kwargs)
+        _asr_tmp = prepared_audio.temp_wav_path
         if skip_sec > 0 and _asr_tmp is None and asr_path == path:
             signature = inspect.signature(self._model.transcribe)
             if "clip_timestamps" in signature.parameters:
@@ -2082,30 +2298,37 @@ class Transcriber:
                 self._log(
                     "Внимание: пропуск начала недоступен — нет clip_timestamps и не удалось собрать WAV."
                 )
-        asr_started = time.perf_counter()
-        self._stage(
-            "Whisper",
-            "запуск модели: чтение подготовленного WAV, VAD (Silero), признаки — на длинных файлах несколько минут",
+        fast_ultima = (
+            self.asr_profile == "ultima_ru"
+            and self._resolve_ultima_acceleration_mode(prepared_audio.prefer_fast_ultima)
         )
-        try:
-            segments, info = self._model.transcribe(asr_path, **transcribe_kwargs)
-        finally:
-            if _asr_tmp:
-                try:
-                    os.unlink(_asr_tmp)
-                except OSError:
-                    pass
-        prep_elapsed = time.perf_counter() - asr_started
-        _dur_full = float(getattr(info, "duration", 0.0) or 0.0)
-        _dur_vad = float(getattr(info, "duration_after_vad", _dur_full) or _dur_full)
-        self._stage(
-            "Whisper",
-            f"признаки за {prep_elapsed:.1f} с (аудио {_dur_full:.1f} с, после VAD ~{_dur_vad:.1f} с речи); "
-            f"дальше в этом же этапе — потоковое декодирование и сбор текста (логи «ASR прогресс»); "
-            f"отсев IVR и галлюцинаций промпта — по мере поступления сегментов",
+        transcribe_kwargs = self._apply_profile_decode_settings(
+            transcribe_kwargs,
+            fast_ultima=fast_ultima,
         )
-        decode_started = time.perf_counter()
-        _last_progress_log = decode_started
+        _wts_log = (
+            "off (API не поддерживает)"
+            if not _word_ts_enabled
+            else (
+                "on"
+                if transcribe_kwargs.get("word_timestamps")
+                else "off (ускорение, CALLQA_ASR_WORD_TIMESTAMPS=0)"
+            )
+        )
+        _ultima_mode_note = ""
+        if self.asr_profile == "ultima_ru":
+            _ultima_mode_note = (
+                f", ultima_mode={'fast' if fast_ultima else 'full'}, "
+                f"denoise={'on' if prepared_audio.denoise_applied else 'off'}"
+            )
+        self._stage(
+            "ASR-параметры",
+            f"profile={self.asr_profile}, beam={transcribe_kwargs['beam_size']}, "
+            f"best_of={transcribe_kwargs['best_of']}, patience={transcribe_kwargs.get('patience', 'n/a')}, "
+            f"word_timestamps={_wts_log}"
+            + (", ru_hotwords=on" if transcribe_kwargs.get("hotwords") else "")
+            + _ultima_mode_note,
+        )
         # Hallucination filter: discard segments whose words overlap >50% with initial_prompt.
         # Whisper sometimes repeats the prompt verbatim when audio is silent or clipped.
         _raw_prompt = str(transcribe_kwargs.get("initial_prompt") or "")
