@@ -122,7 +122,7 @@ python transcription.py /path/to/call.wav --asr-profile medium_ru --enable-post-
 
 После ответа модели пункт чек-листа **«Называл заявителя по имени ≥2 раз»** уточняется **по тексту** (подсчёт в репликах оператора, как в локальном `CallQualityEvaluator`); пересчитываются **script_score** и **итоговый балл**, если значение изменилось.
 
-По умолчанию в UI и по нашей рекомендации для ЕКЦ — **YandexGPT Lite** (`yandexgpt-lite`): он даёт лучший баланс цены и качества для русскоязычной оценки звонков. **YandexGPT Pro** (`yandexgpt/latest`) оставлен как более дорогой вариант для сложных кейсов, где важен максимум точности.
+По умолчанию в UI и по нашей рекомендации для ЕКЦ — **YandexGPT Lite** (`yandexgpt-lite`): он даёт лучший баланс цены и качества для русскоязычной оценки звонков. Также доступны **YandexGPT Pro** (`yandexgpt/latest`) для сложных кейсов и **Alice AI LLM** (`aliceai-llm/latest`) для отдельного сравнения через тот же API Yandex AI Studio.
 
 **Настройка:**
 
@@ -135,6 +135,7 @@ YANDEX_API_KEY=AQVNw...
 YANDEX_FOLDER_ID=b1g...
 YANDEX_CLOUD_MODEL=yandexgpt-lite
 # YANDEX_CLOUD_MODEL=yandexgpt/latest
+# YANDEX_CLOUD_MODEL=aliceai-llm/latest
 ```
 
 При ошибке API оценка автоматически переключается на встроенную эвристику (fallback), звонок не теряется.

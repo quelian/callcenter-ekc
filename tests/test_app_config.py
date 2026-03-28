@@ -30,9 +30,9 @@ def test_load_app_config_clamps_yandex_timeout(monkeypatch) -> None:
 def test_load_app_config_keeps_custom_yandex_model(monkeypatch) -> None:
     monkeypatch.setenv("YANDEX_API_KEY", "token")
     monkeypatch.setenv("YANDEX_FOLDER_ID", "folder")
-    monkeypatch.setenv("YANDEX_CLOUD_MODEL", "yandexgpt/latest")
+    monkeypatch.setenv("YANDEX_CLOUD_MODEL", "aliceai-llm/latest")
 
     cfg = load_app_config()
 
     assert cfg.yandex_cloud.configured
-    assert cfg.yandex_cloud.model == "yandexgpt/latest"
+    assert cfg.yandex_cloud.model == "aliceai-llm/latest"

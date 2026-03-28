@@ -15,11 +15,13 @@ if TYPE_CHECKING:
 _YANDEX_MODEL_ORDER = (
     "yandexgpt-lite",
     "yandexgpt/latest",
+    "aliceai-llm/latest",
 )
 
 _YANDEX_MODEL_LABELS = {
     "yandexgpt-lite": "YandexGPT Lite (рекомендуем)",
     "yandexgpt/latest": "YandexGPT Pro",
+    "aliceai-llm/latest": "Alice AI LLM",
 }
 
 
@@ -206,7 +208,8 @@ def render_sidebar(app_version_label: str, app_version_date: str) -> SidebarStat
                 help=(
                     "Тот же API-ключ Yandex AI Studio. "
                     "Lite — лучший баланс цены и качества для оценки русскоязычных звонков; "
-                    "Pro — для самых сложных кейсов, когда важнее максимум точности."
+                    "Pro — для самых сложных кейсов, когда важнее максимум точности; "
+                    "Alice AI LLM — отдельная модель Yandex для экспериментов и сравнения качества."
                 ),
             )
 
