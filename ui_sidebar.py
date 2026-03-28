@@ -15,13 +15,11 @@ if TYPE_CHECKING:
 _YANDEX_MODEL_ORDER = (
     "yandexgpt-lite",
     "yandexgpt/latest",
-    "deepseek-v32/latest",
 )
 
 _YANDEX_MODEL_LABELS = {
-    "yandexgpt-lite": "YandexGPT Lite (по умолчанию)",
+    "yandexgpt-lite": "YandexGPT Lite (рекомендуем)",
     "yandexgpt/latest": "YandexGPT Pro",
-    "deepseek-v32/latest": "DeepSeek V3.2",
 }
 
 
@@ -207,7 +205,8 @@ def render_sidebar(app_version_label: str, app_version_date: str) -> SidebarStat
                 key="yandex_cloud_model_lp",
                 help=(
                     "Тот же API-ключ Yandex AI Studio. "
-                    "Lite — быстрее; Pro — точнее; DeepSeek V3.2 — отдельная модель через тот же Yandex API."
+                    "Lite — лучший баланс цены и качества для оценки русскоязычных звонков; "
+                    "Pro — для самых сложных кейсов, когда важнее максимум точности."
                 ),
             )
 

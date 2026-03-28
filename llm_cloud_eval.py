@@ -15,7 +15,9 @@ from __future__ import annotations
 import json
 import os
 import re
+import socket
 import ssl
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -38,6 +40,8 @@ from role_misattribution_fix import fix_operator_thanks_mislabeled_as_applicant
 
 _BASE_URL = "https://llm.api.cloud.yandex.net/v1"
 _DEFAULT_MODEL = "yandexgpt-lite"
+_RETRYABLE_HTTP_STATUS_CODES = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
+_RETRY_BACKOFF_SECONDS = (1.0, 2.5)
 
 
 @dataclass(frozen=True)
@@ -878,12 +882,39 @@ def _make_ssl_context() -> ssl.SSLContext:
         return ssl.create_default_context()
 
 
+def _describe_request_error(exc: BaseException) -> str:
+    if isinstance(exc, urllib.error.URLError) and exc.reason is not None:
+        reason = exc.reason
+        return _describe_request_error(reason) if isinstance(reason, BaseException) else str(reason)
+    text = str(exc).strip()
+    return text or exc.__class__.__name__
+
+
+def _is_retryable_request_error(exc: BaseException) -> bool:
+    if isinstance(exc, urllib.error.HTTPError):
+        return exc.code in _RETRYABLE_HTTP_STATUS_CODES
+    if isinstance(exc, urllib.error.URLError):
+        reason = exc.reason
+        if isinstance(reason, BaseException):
+            return _is_retryable_request_error(reason)
+        reason_text = str(reason or "").lower()
+        return "timed out" in reason_text or "timeout" in reason_text or "temporary" in reason_text
+    if isinstance(exc, (TimeoutError, socket.timeout, ConnectionError, ssl.SSLError)):
+        return True
+    if isinstance(exc, OSError):
+        reason_text = str(exc).lower()
+        if any(token in reason_text for token in ("timed out", "timeout", "temporary", "handshake")):
+            return True
+    return False
+
+
 def _call_yandex_messages(
     system_prompt: str,
     user_content: str,
     cfg: YandexCloudConfig,
     max_tokens: int = 1200,
     temperature: float = 0.1,
+    log: Callable[[str], None] | None = None,
 ) -> str:
     """Универсальный HTTP-запрос к Yandex AI Studio; возвращает текст ответа модели."""
     model_uri = f"gpt://{cfg.folder_id}/{cfg.model}"
@@ -909,9 +940,26 @@ def _call_yandex_messages(
             "x-data-logging-enabled": "false",
         },
     )
-    timeout = max(15.0, min(float(cfg.timeout_seconds), 300.0))
-    with urllib.request.urlopen(req, timeout=timeout, context=_make_ssl_context()) as resp:
-        raw = resp.read().decode("utf-8", errors="replace")
+    base_timeout = max(15.0, min(float(cfg.timeout_seconds), 300.0))
+    max_attempts = len(_RETRY_BACKOFF_SECONDS) + 1
+    raw = ""
+    for attempt in range(1, max_attempts + 1):
+        timeout = min(base_timeout + (attempt - 1) * 15.0, 300.0)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout, context=_make_ssl_context()) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+            break
+        except Exception as exc:
+            if attempt >= max_attempts or not _is_retryable_request_error(exc):
+                raise
+            delay = _RETRY_BACKOFF_SECONDS[attempt - 1]
+            if log is not None:
+                log(
+                    "[cloud_eval] Временный сетевой сбой Yandex API "
+                    f"({type(exc).__name__}: {_describe_request_error(exc)}). "
+                    f"Повтор {attempt + 1}/{max_attempts} через {delay:.1f} с."
+                )
+            time.sleep(delay)
     body = json.loads(raw)
     choices = body.get("choices") or []
     if not choices:
@@ -941,6 +989,7 @@ def _call_yandex_api(
     cfg: YandexCloudConfig,
     *,
     extra_system: str = "",
+    log: Callable[[str], None] | None = None,
 ) -> str:
     """Запрос для режима облачной оценки (использует eval-промпт).
 
@@ -953,6 +1002,7 @@ def _call_yandex_api(
         user_content=user_content,
         cfg=cfg,
         max_tokens=2000,
+        log=log,
     )
     # Validate JSON — if broken, retry once with a correction request
     try:
@@ -970,6 +1020,7 @@ def _call_yandex_api(
             ),
             cfg=cfg,
             max_tokens=2000,
+            log=log,
         )
         if not (retry_content or "").strip():
             raise ValueError("yandex_response:empty_content_after_retry")
@@ -1095,6 +1146,7 @@ def _ask_operator_name_only(
             cfg=cfg,
             max_tokens=24,
             temperature=0.0,
+            log=_log,
         )
     except Exception as exc:
         _log(f"[cloud_eval] name-only API ошибка: {type(exc).__name__}: {exc}")
@@ -1168,6 +1220,7 @@ def _ask_applicant_name_only(
             cfg=cfg,
             max_tokens=80,
             temperature=0.0,
+            log=_log,
         )
     except Exception as exc:
         _log(f"[cloud_eval] applicant-name-only API ошибка: {type(exc).__name__}: {exc}")
@@ -1207,7 +1260,7 @@ def run_cloud_evaluation(
         )
         if (extra_eval_instructions or "").strip():
             _log("[cloud_eval] Учитываются дополнительные указания пользователя для оценки.")
-        content = _call_yandex_api(flat_text, role_text, cfg, extra_system=extra_sys)
+        content = _call_yandex_api(flat_text, role_text, cfg, extra_system=extra_sys, log=_log)
         data = _extract_json(content)
         evaluation = _build_evaluation(data, forced_operator_name)
 

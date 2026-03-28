@@ -30,9 +30,9 @@ def test_load_app_config_clamps_yandex_timeout(monkeypatch) -> None:
 def test_load_app_config_keeps_custom_yandex_model(monkeypatch) -> None:
     monkeypatch.setenv("YANDEX_API_KEY", "token")
     monkeypatch.setenv("YANDEX_FOLDER_ID", "folder")
-    monkeypatch.setenv("YANDEX_CLOUD_MODEL", "deepseek-v32/latest")
+    monkeypatch.setenv("YANDEX_CLOUD_MODEL", "yandexgpt/latest")
 
     cfg = load_app_config()
 
     assert cfg.yandex_cloud.configured
-    assert cfg.yandex_cloud.model == "deepseek-v32/latest"
+    assert cfg.yandex_cloud.model == "yandexgpt/latest"
