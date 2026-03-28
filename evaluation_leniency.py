@@ -9,9 +9,12 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 from operator_staff import operator_in_leniency_focus
+
+if TYPE_CHECKING:
+    from transcription import QualityEvaluation
 
 
 def apply_focus_operator_adjustments(
@@ -40,9 +43,23 @@ def apply_focus_operator_adjustments(
 
     positives = list(evaluation.positives)
     negatives = [n for n in evaluation.negatives if (n or "").strip()]
-    # Меньше замечаний, без «прострела» статистики: оставляем самое важное
-    if len(negatives) > 2:
-        negatives = negatives[:2]
+    detailed_prefixes = (
+        "Слова-паразиты:",
+        "Уменьшительно-ласкательные формы:",
+        "Категоричные/беспомощные формулировки:",
+        "Слова-раздражители и некорректные фразы:",
+        "Слишком официальные формулировки:",
+        "Некорректные обращения вместо имени:",
+        "Обращение по имени:",
+        "Обращение по имени не выполнено:",
+        "Речевые повторы:",
+    )
+    detailed = [n for n in negatives if any(n.startswith(prefix) for prefix in detailed_prefixes)]
+    general = [n for n in negatives if n not in detailed]
+    # Смягчаем общий список, но конкретные речевые нарушения не скрываем.
+    if len(general) > 2:
+        general = general[:2]
+    negatives = general + detailed
 
     mentor_line = (
         "Контекст развития: сотрудник на этапе усиленной поддержки; "
@@ -63,5 +80,5 @@ def apply_focus_operator_adjustments(
         engagement_score=engagement,
         total_score=total_score,
         positives=positives[:10],
-        negatives=negatives[:3],
+        negatives=negatives[:10],
     )

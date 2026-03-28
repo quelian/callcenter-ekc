@@ -198,7 +198,7 @@ def render_feedback(positives: list[str], negatives: list[str]) -> None:
     with c1:
         st.markdown('<div class="section-title">💪 Сильные стороны</div>', unsafe_allow_html=True)
         if positives:
-            for item in positives[:5]:
+            for item in positives:
                 st.markdown(
                     f'<div class="feedback-item pos">✦ {item}</div>',
                     unsafe_allow_html=True,
@@ -211,7 +211,7 @@ def render_feedback(positives: list[str], negatives: list[str]) -> None:
     with c2:
         st.markdown('<div class="section-title">⚠️ Замечания</div>', unsafe_allow_html=True)
         if negatives:
-            for item in negatives[:5]:
+            for item in negatives:
                 st.markdown(
                     f'<div class="feedback-item neg">→ {item}</div>',
                     unsafe_allow_html=True,

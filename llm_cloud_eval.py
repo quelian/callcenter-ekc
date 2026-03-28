@@ -19,14 +19,21 @@ import ssl
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from functools import lru_cache
+from pathlib import Path
 from typing import Callable
 
+from applicant_name_utils import (
+    choose_authoritative_applicant_name,
+    normalize_applicant_name_candidate,
+)
 from app_config import load_app_config
 from operator_staff import (
     canonicalize_operator_name,
     operator_in_leniency_focus,
     operators_prompt_sentence,
 )
+from results_paths import project_root
 from role_misattribution_fix import fix_operator_thanks_mislabeled_as_applicant
 
 _BASE_URL = "https://llm.api.cloud.yandex.net/v1"
@@ -43,6 +50,57 @@ class YandexCloudConfig:
 
 def load_cloud_config_from_env() -> YandexCloudConfig | None:
     return load_app_config().yandex_cloud.to_runtime_config()
+
+
+@lru_cache(maxsize=1)
+def _load_ekc_dialog_standards_excerpt(max_chars: int = 3200) -> str:
+    path = project_root() / "Стандарты диалогов ЕКЦ"
+    if not Path(path).exists():
+        return ""
+    try:
+        text = Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+
+    keywords = (
+        "слова-паразиты",
+        "уменьшительно-ласкательные",
+        "слишком официальные фразы",
+        "обращайтесь к ним по имени",
+        "обращайтесь по имени",
+        "не грубите мне",
+        "не могу",
+        "невозможно",
+        "информация отсутствует",
+        "к сожалению",
+    )
+    chunks: list[str] = []
+    seen: set[str] = set()
+    for paragraph in re.split(r"\n\s*\n+", text):
+        compact = re.sub(r"\s+", " ", paragraph).strip()
+        if not compact:
+            continue
+        lowered = compact.lower()
+        if not any(keyword in lowered for keyword in keywords):
+            continue
+        if compact in seen:
+            continue
+        seen.add(compact)
+        chunks.append(f"• {compact}")
+        if len("\n".join(chunks)) >= max_chars:
+            break
+
+    if not chunks:
+        return ""
+    excerpt = "\n".join(chunks)
+    if len(excerpt) > max_chars:
+        excerpt = excerpt[:max_chars].rstrip() + "…"
+    return (
+        "\n\nДОПОЛНИТЕЛЬНЫЕ ТРЕБОВАНИЯ ИЗ ЛОКАЛЬНОГО ФАЙЛА "
+        "«Стандарты диалогов ЕКЦ»:\n"
+        f"{excerpt}\n"
+        "Если эти требования противоречат твоей общей привычке оценивания, выбирай требования ЕКЦ.\n"
+    )
 
 
 _SYSTEM_PROMPT = f"""\
@@ -69,6 +127,7 @@ _SYSTEM_PROMPT = f"""\
 
 Если оператор просто ответил на вопрос и попрощался — это 5, не 8.
 Оценка 9–10 по любому критерию должна быть ИСКЛЮЧЕНИЕМ, а не нормой.
+{_load_ekc_dialog_standards_excerpt()}
 
 ═══════════════════════════════════════════════════════════
 ЗАДАЧА 1 — Определи имена
@@ -92,10 +151,12 @@ script_score — Соблюдение скрипта звонка
 Проверь 7 обязательных пунктов (каждый ≈1.4 балла):
 
 1. ПРИВЕТСТВИЕ + ПРЕДЛОЖЕНИЕ ПОМОЧЬ
-   ВСЕГДА «да» — все операторы ЕКЦ 100% выполняют этот пункт. Ставь «да» автоматически.
+   «да» только если в начале разговора реально есть приветствие И предложение помочь.
+   Если приветствие или предложение помощи не найдены в тексте — ставь «нет».
 
 2. ПРЕДСТАВЛЕНИЕ ПО ИМЕНИ
-   ВСЕГДА «да» — все операторы ЕКЦ 100% называют своё имя. Ставь «да» автоматически.
+   «да» только если оператор действительно представился по имени в транскрипте.
+   Не ставь «да» автоматически по предположению.
 
 3. ЗНАКОМСТВО С ЗАЯВИТЕЛЕМ
    Спросил имя заявителя («как вас зовут?», «как к вам обращаться?», «представьтесь, пожалуйста») ИЛИ
@@ -164,6 +225,11 @@ speech_score — Чистота и культура речи оператора
 
 РЕЧЕВЫЕ ПОВТОРЫ — «−1» если оператор многократно использует одно и то же слово/фразу
   (однообразная, «конвейерная» речь без синонимов).
+
+ОБРАЩЕНИЕ ПО ИМЕНИ И НЕКОРРЕКТНЫЕ ОБРАЩЕНИЯ:
+  если имя заявителя известно, но оператор не обращается по имени — это отдельное замечание;
+  если вместо имени используются «девушка», «женщина», «мужчина», «молодой человек», «клиент», «абонент» —
+  это некорректное обращение и отдельное снижение.
 
 Минимум speech_score: 0 баллов.
 
@@ -266,6 +332,8 @@ engagement_score — Вовлечённость, эмоциональность 
   Если нарушений нет — верни пустой массив [].
   Цитируй только реплики оператора, не заявителя.
   Для пунктов 5–7 (фаза закрытия) — цитируй только конец разговора.
+  Если нашёл слова-паразиты, уменьшительные формы, слова-раздражители, слишком официальные фразы,
+  некорректные обращения или отсутствие обращения по имени — ОБЯЗАТЕЛЬНО добавь их в negatives отдельными пунктами.
 
 ВАЖНО: перед выставлением баллов спроси себя:
   «Этот звонок действительно ОТЛИЧНЫЙ (9–10), или оператор просто сделал минимум?»
@@ -400,70 +468,9 @@ def _safe_strlist(data: dict, key: str) -> list[str]:
     return [str(s) for s in v if s]
 
 
-# Слова, которые модель иногда кладёт в поле имени, но это не ФИО заявителя
-_APPLICANT_NAME_BLOCKLIST = frozenset(
-    {
-        "оператор",
-        "заявитель",
-        "клиент",
-        "абонент",
-        "слушаю",
-        "здравствуйте",
-        "добрый",
-        "день",
-        "колл",
-        "центр",
-        "двфу",
-        "университет",
-        "заявление",
-        "понимаю",
-        "подскажите",
-        "спасибо",
-        "пожалуйста",
-        "здравствуйте",
-        "добрый",
-        "алло",
-        "слушаю",
-        "вопрос",
-        "проблема",
-        "обращение",
-        "документы",
-        "справка",
-        "заявка",
-    }
-)
-
-
 def _format_applicant_name_candidate(raw: str) -> str | None:
     """Если строка похожа на имя человека (не оператор из штата) — нормализует для applicant_name."""
-    s = (raw or "").strip()
-    if not s:
-        return None
-    low = s.lower()
-    if low in _APPLICANT_NAME_BLOCKLIST:
-        return None
-    parts = re.findall(r"[А-Яа-яЁё]+(?:-[А-Яа-яЁё]+)?", s)
-    if not parts or len(parts) > 3:
-        return None
-    for p in parts:
-        pl = p.lower()
-        if pl in _APPLICANT_NAME_BLOCKLIST:
-            return None
-        if len(p) < 2 or len(p) > 24:
-            return None
-    titled: list[str] = []
-    for p in parts:
-        if "-" in p:
-            titled.append(
-                "-".join(
-                    (seg[0].upper() + seg[1:].lower()) if len(seg) > 1 else seg.upper()
-                    for seg in p.split("-")
-                    if seg
-                )
-            )
-        else:
-            titled.append(p[0].upper() + p[1:].lower() if len(p) > 1 else p.upper())
-    return " ".join(titled)
+    return normalize_applicant_name_candidate(raw)
 
 
 def _extract_applicant_name_from_any_json_or_text(raw: str) -> str | None:
@@ -570,24 +577,20 @@ def _find_name_mentions_checklist_index(script_details: list[str]) -> int | None
 
 
 def _resolve_applicant_name_for_merge(
-    evaluation,
     flat_text: str,
     role_text: str,
 ) -> str | None:
-    """Имя заявителя: сначала из ответа LLM, иначе эвристики CallQualityEvaluator."""
+    """Имя заявителя только по тексту диалога, без доверия к текущему полю evaluation."""
     from transcription import CallQualityEvaluator
 
     ev = CallQualityEvaluator()
-    if evaluation.applicant_name and str(evaluation.applicant_name).strip():
-        return str(evaluation.applicant_name).strip()
-
     applicant_text_raw = ev._extract_role_text(role_text, "Заявитель")
     name = ev._find_applicant_name_from_dialog(role_text)
     if not name and (applicant_text_raw or "").strip():
         name = ev._extract_name_from_applicant_reply(applicant_text_raw)
     if not name:
         name = ev._find_applicant_name(applicant_text_raw or flat_text)
-    return name
+    return normalize_applicant_name_candidate(name or "")
 
 
 def apply_deterministic_name_mentions_merge(
@@ -620,9 +623,11 @@ def apply_deterministic_name_mentions_merge(
     operator_lower = ev._extract_role_text(role_text, "Оператор").lower()
     applicant_lower = ev._extract_role_text(role_text, "Заявитель").lower()
 
-    applicant_name = _resolve_applicant_name_for_merge(evaluation, flat_text, role_text)
-    if applicant_name and not (evaluation.applicant_name or "").strip():
-        evaluation.applicant_name = applicant_name
+    applicant_name = choose_authoritative_applicant_name(
+        evaluation.applicant_name,
+        _resolve_applicant_name_for_merge(flat_text, role_text),
+    )
+    evaluation.applicant_name = applicant_name
 
     old_line = details[idx] or ""
     _, _, old_val = old_line.rpartition(":")
@@ -658,6 +663,72 @@ def apply_deterministic_name_mentions_merge(
     new_script = _script_score_from_seven_checklist(details)
     if new_script is not None:
         evaluation.script_score = new_script
+        _recalculate_total_score(evaluation)
+
+
+def _dedupe_keep_order(items: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in items:
+        token = (item or "").strip()
+        if not token or token in seen:
+            continue
+        seen.add(token)
+        out.append(token)
+    return out
+
+
+def apply_deterministic_speech_findings_merge(
+    evaluation,
+    flat_text: str,
+    role_text: str,
+    forced_operator_name: str | None,
+    log: Callable[[str], None],
+) -> None:
+    """
+    После облачной оценки: дотягиваем объективные речевые замечания из локального evaluator.
+    Это нужно, чтобы LLM не пропускал слова-паразиты, некорректные обращения и отсутствие имени.
+    """
+    from transcription import CallQualityEvaluator
+
+    heuristic = CallQualityEvaluator().evaluate(
+        flat_text,
+        role_text,
+        forced_operator_name=forced_operator_name,
+        forced_applicant_name=choose_authoritative_applicant_name(
+            evaluation.applicant_name,
+            _resolve_applicant_name_for_merge(flat_text, role_text),
+        ),
+    )
+    detailed_prefixes = (
+        "Слова-паразиты:",
+        "Уменьшительно-ласкательные формы:",
+        "Категоричные/беспомощные формулировки:",
+        "Слова-раздражители и некорректные фразы:",
+        "Слишком официальные формулировки:",
+        "Некорректные обращения вместо имени:",
+        "Обращение по имени:",
+        "Обращение по имени не выполнено:",
+        "Речевые повторы:",
+    )
+    additions = [
+        item
+        for item in heuristic.negatives
+        if any(item.startswith(prefix) for prefix in detailed_prefixes)
+    ]
+    if additions:
+        before_count = len(evaluation.negatives)
+        evaluation.negatives = _dedupe_keep_order(list(evaluation.negatives) + additions)
+        added_count = len(evaluation.negatives) - before_count
+        if added_count > 0:
+            log(f"[cloud_eval] Добавлено детермин. речевых замечаний: {added_count}.")
+
+    if heuristic.speech_score < evaluation.speech_score:
+        log(
+            f"[cloud_eval] speech_score снижен по детермин. правилам: "
+            f"{evaluation.speech_score} → {heuristic.speech_score}."
+        )
+        evaluation.speech_score = heuristic.speech_score
         _recalculate_total_score(evaluation)
 
 
@@ -972,6 +1043,7 @@ def _ask_applicant_name_only(
     flat_text: str,
     cfg: YandexCloudConfig,
     _log: Callable[[str], None],
+    current_candidate: str | None = None,
 ) -> str | None:
     """
     Отдельный API-запрос на имя заявителя + строгая валидация.
@@ -989,14 +1061,24 @@ def _ask_applicant_name_only(
         "Ты извлекаешь ИМЯ ЗАЯВИТЕЛЯ из телефонного диалога. "
         "Верни ТОЛЬКО JSON формата {\"applicant_name\": \"Имя\"} или {\"applicant_name\": null}. "
         "В applicant_name допускаются только личные имена/имя+фамилия человека. "
-        "Запрещено возвращать обычные слова (например: «заявление», «понимаю», «вопрос», «спасибо»)."
+        "Запрещено возвращать обычные слова, дни недели, местоимения, вводные слова или фразы "
+        "(например: «заявление», «понимаю», «вопрос», «спасибо», «Воскресенье», «Такое», «Добрый день»)."
     )
-    user = (
-        "Выдели имя заявителя из фрагмента разговора. "
-        "Если имя не названо явно или есть сомнения — верни null.\n\n"
-        f"Фрагмент:\n{snippet}\n\n"
-        "Ответ: только JSON."
-    )
+    if current_candidate:
+        user = (
+            "Проверь гипотезу по имени заявителя и при необходимости исправь её. "
+            "Если гипотеза неверна или в диалоге имя не названо явно — верни null.\n\n"
+            f"Текущая гипотеза: {current_candidate}\n\n"
+            f"Фрагмент:\n{snippet}\n\n"
+            "Ответ: только JSON."
+        )
+    else:
+        user = (
+            "Выдели имя заявителя из фрагмента разговора. "
+            "Если имя не названо явно или есть сомнения — верни null.\n\n"
+            f"Фрагмент:\n{snippet}\n\n"
+            "Ответ: только JSON."
+        )
     try:
         raw = _call_yandex_messages(
             system_prompt=system,
@@ -1056,16 +1138,43 @@ def run_cloud_evaluation(
                 evaluation.operator_name = name_only
                 evaluation.operator_in_staff = True
 
-        # Отдельная LLM-валидация applicant_name: убираем случайные слова вместо имени.
-        if not (evaluation.applicant_name or "").strip():
+        current_applicant = normalize_applicant_name_candidate(str(evaluation.applicant_name or ""))
+        if current_applicant:
+            _log("[cloud_eval] Дополнительная нейровалидация applicant_name…")
+        else:
             _log("[cloud_eval] Имя заявителя пустое/невалидное — уточняющий API-запрос…")
-            applicant_only = _ask_applicant_name_only(role_text, flat_text, cfg, _log)
-            if applicant_only:
-                evaluation.applicant_name = applicant_only
-                _log(f"[cloud_eval] Уточняющий запрос заявителя вернул: «{applicant_only}».")
+        applicant_only = _ask_applicant_name_only(
+            role_text,
+            flat_text,
+            cfg,
+            _log,
+            current_candidate=current_applicant,
+        )
+        heuristic_applicant = _resolve_applicant_name_for_merge(flat_text, role_text)
+        if applicant_only:
+            resolved_applicant = applicant_only
+        elif current_applicant and heuristic_applicant == current_applicant:
+            resolved_applicant = current_applicant
+        else:
+            resolved_applicant = heuristic_applicant
+        if applicant_only and applicant_only != current_applicant:
+            _log(f"[cloud_eval] Нейровалидация applicant_name уточнила имя: «{applicant_only}».")
+        elif current_applicant and current_applicant != resolved_applicant:
+            _log(
+                f"[cloud_eval] applicant_name «{current_applicant}» заменено на "
+                f"«{resolved_applicant or 'null'}» после валидации."
+            )
+        evaluation.applicant_name = resolved_applicant
 
         # Объективный пункт чек-листа по тексту (модель часто ошибается)
         apply_deterministic_name_mentions_merge(evaluation, flat_text, role_text, _log)
+        apply_deterministic_speech_findings_merge(
+            evaluation,
+            flat_text,
+            role_text,
+            forced_operator_name,
+            _log,
+        )
 
         from evaluation_leniency import apply_focus_operator_adjustments
 

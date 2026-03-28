@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import atexit
+from collections import Counter
 import inspect
 import os
 import sys
@@ -42,6 +43,7 @@ from app_config import load_app_environment
 from hf_hub_sync import HF_HUB_DOWNLOAD_LOCK, force_huggingface_hub_online
 from operator_staff import OPERATOR_ALIASES
 from audio_io_safe import is_probably_compressed_audio, load_audio_mono_16k_safe
+from applicant_name_utils import APPLICANT_NAME_NOISE_WORDS, normalize_applicant_name_candidate
 from role_misattribution_fix import fix_operator_thanks_mislabeled_as_applicant
 from role_semantic_refine import _semantic_refine_enabled, try_semantic_role_refine
 
@@ -2595,6 +2597,7 @@ class CallQualityEvaluator:
         r"\bээ+\b",
         r"\bэм+\b",
         r"\bну\b",
+        r"\bвот\b",
         r"\bкак\s+бы\b",
         r"\bтипа\b",
         r"\bв\s+общем\b",
@@ -2605,6 +2608,9 @@ class CallQualityEvaluator:
         r"\bэто\s+самое\b",
         r"\bпоходу\b",
         r"\bмаленько\b",
+        r"\bсмотрите(?=,|\s+(?:пожалуйста|у|вы|я|можете|нужно|необходимо|по|в|давайте)\b)",
+        r"\bзначит\b",
+        r"\bполучается\b",
     )
     _DIMINUTIVE_PATTERNS = (
         r"\bминуточку\b",
@@ -2616,20 +2622,63 @@ class CallQualityEvaluator:
         r"\bсправочка\b",
         r"\bденежки\b",
     )
-    _NEGATIVE_PHRASES = (
+    _REFUSAL_PATTERNS = (
         r"\bк\s+сожалению\b",
         r"\bне\s+знаю\b",
         r"\bне\s+могу\s+подсказать\b",
+        r"\bне\s+могу\s+помочь\b",
+        r"\bничем\s+не\s+могу\s+помочь\b",
+        r"\bничем\s+не\s+можем\s+помочь\b",
+        r"\bне\s+получится\b",
+        r"\bневозможно\b",
+        r"\bинформация\s+отсутствует\b",
+        r"\bнет\s+такой\s+информации\b",
         r"\bэто\s+не\s+ко\s+мне\b",
         r"\bэто\s+не\s+моя\s+зона\b",
-        r"(?:^|\.\s+|\n)нет\b",
-        r"\bвам\s+нужно\b",
-        r"\bвы\s+должны\b",
+        r"\bэто\s+не\s+в\s+моей\s+компетенции\b",
+        r"\bмы\s+этим\s+не\s+занимаемся\b",
+        r"\bя\s+этим\s+не\s+занимаюсь\b",
+    )
+    _IRRITANT_PATTERNS = (
+        r"\bне\s+грубите\s+мне\b",
+        r"\bне\s+кричите\b",
+        r"\bуспокойтесь\b",
+        r"\bя\s+же\s+вам\s+сказал\b",
+        r"\bя\s+уже\s+сказал\b",
         r"\bвы\s+не\s+поняли\b",
         r"\bвы\s+неправильно\s+поняли\b",
-        r"\bваша\s+проблема\b",
         r"\bвы\s+не\s+правы\b",
+        r"\bне\s+нужно\s+так\s+говорить\b",
+        r"\bне\s+надо\s+мне\b",
+        r"\bваша\s+проблема\b",
         r"\bвас\s+беспокоит\b",
+        r"\bэто\s+ваши\s+проблемы\b",
+        r"\bсами\s+виноваты\b",
+    )
+    _OVERFORMAL_PATTERNS = (
+        r"\bучитывая\s+в[сc][её]\s+вышесказанн",
+        r"\bво\s+избежание\b",
+        r"\bдовожу\s+до\s+вашего\s+сведения\b",
+        r"\bв\s+рамках\s+данного\s+вопроса\b",
+        r"\bна\s+основании\b",
+        r"\bв\s+соответствии\s+с\b",
+    )
+    _GENERIC_ADDRESS_PATTERNS = (
+        r"\bдевушка\b",
+        r"\bженщина\b",
+        r"\bмужчина\b",
+        r"\bмолодой\s+человек\b",
+        r"\bуважаемый\s+клиент\b",
+        r"\bуважаемая\s+клиентка\b",
+        r"\bабонент\b",
+        r"\bклиент\b",
+        r"\bгражданин\b",
+        r"\bгражданка\b",
+    )
+    _NEGATIVE_PHRASES = (
+        *_REFUSAL_PATTERNS,
+        *_IRRITANT_PATTERNS,
+        r"(?:^|\.\s+|\n)нет\b",
     )
     _CONSULTATION_PATTERNS = (
         r"\bнеобходимо\b",
@@ -2700,41 +2749,146 @@ class CallQualityEvaluator:
     )
 
     # Слова, которые не считаем именем в коротком ответе заявителя.
-    _APPLICANT_NAME_STOPWORDS = frozenset(
+    _APPLICANT_NAME_STOPWORDS = APPLICANT_NAME_NOISE_WORDS | {"я"}
+    _REPETITION_STOPWORDS = frozenset(
         {
+            "это",
+            "вот",
+            "как",
+            "так",
+            "ну",
             "да",
             "нет",
-            "ну",
-            "вот",
-            "это",
             "вам",
             "вас",
-            "меня",
-            "мне",
-            "нас",
-            "здесь",
-            "там",
-            "ага",
-            "угу",
-            "спасибо",
+            "для",
+            "или",
+            "что",
+            "чтобы",
+            "если",
+            "когда",
+            "только",
+            "тоже",
+            "ещё",
+            "еще",
             "пожалуйста",
-            "здравствуйте",
-            "добрый",
-            "день",
-            "алло",
-            "слушаю",
-            "хорошо",
-            "ладно",
-            "понятно",
-            "извините",
-            "простите",
-            "конечно",
-            "я",
         }
     )
 
     def _count_pattern_hits(self, text: str, patterns: tuple[str, ...]) -> int:
         return sum(1 for pattern in patterns if re.search(pattern, text))
+
+    @staticmethod
+    def _collect_pattern_matches(text: str, patterns: tuple[str, ...]) -> list[str]:
+        matches: list[str] = []
+        for pattern in patterns:
+            for match in re.finditer(pattern, text, flags=re.IGNORECASE):
+                token = re.sub(r"\s+", " ", match.group(0).strip())
+                if token:
+                    matches.append(token)
+        return matches
+
+    @staticmethod
+    def _summarize_phrase_matches(matches: list[str], *, max_items: int = 5) -> str:
+        if not matches:
+            return ""
+        counter = Counter(
+            re.sub(r"\s+", " ", token.strip().lower())
+            for token in matches
+            if token and token.strip()
+        )
+        parts = []
+        for phrase, count in counter.most_common(max_items):
+            label = f'"{phrase}"'
+            if count > 1:
+                label += f"×{count}"
+            parts.append(label)
+        summary = ", ".join(parts)
+        if len(counter) > max_items:
+            summary += ", …"
+        return summary
+
+    @classmethod
+    def _repeated_operator_words(cls, text: str) -> list[tuple[str, int]]:
+        words = re.findall(r"[а-яёa-z]{3,}", (text or "").lower())
+        counter = Counter(
+            word
+            for word in words
+            if word not in cls._REPETITION_STOPWORDS and len(word) >= 4
+        )
+        return [
+            (word, count)
+            for word, count in counter.most_common()
+            if count >= 4
+        ][:3]
+
+    def _build_speech_and_service_findings(
+        self,
+        *,
+        operator_text_raw: str,
+        applicant_name: str | None,
+        op_name_hits: int,
+    ) -> tuple[list[str], dict[str, int]]:
+        filler_matches = self._collect_pattern_matches(operator_text_raw, self._FILLER_PATTERNS)
+        diminutive_matches = self._collect_pattern_matches(operator_text_raw, self._DIMINUTIVE_PATTERNS)
+        refusal_matches = self._collect_pattern_matches(operator_text_raw, self._REFUSAL_PATTERNS)
+        irritant_matches = self._collect_pattern_matches(operator_text_raw, self._IRRITANT_PATTERNS)
+        overformal_matches = self._collect_pattern_matches(operator_text_raw, self._OVERFORMAL_PATTERNS)
+        generic_address_matches = self._collect_pattern_matches(operator_text_raw, self._GENERIC_ADDRESS_PATTERNS)
+        repeated_words = self._repeated_operator_words(operator_text_raw)
+
+        findings: list[str] = []
+        if filler_matches:
+            findings.append(
+                "Слова-паразиты: "
+                f"{self._summarize_phrase_matches(filler_matches)} — уберите лишние вводные слова."
+            )
+        if diminutive_matches:
+            findings.append(
+                "Уменьшительно-ласкательные формы: "
+                f"{self._summarize_phrase_matches(diminutive_matches)} — используйте нейтральные формы."
+            )
+        if refusal_matches:
+            findings.append(
+                "Категоричные/беспомощные формулировки: "
+                f"{self._summarize_phrase_matches(refusal_matches)} — вместо отказа предложите вариант решения."
+            )
+        if irritant_matches:
+            findings.append(
+                "Слова-раздражители и некорректные фразы: "
+                f"{self._summarize_phrase_matches(irritant_matches)} — говорите нейтрально-вежливо, без замечаний клиенту."
+            )
+        if overformal_matches:
+            findings.append(
+                "Слишком официальные формулировки: "
+                f"{self._summarize_phrase_matches(overformal_matches)} — по стандарту ЕКЦ нужно говорить проще и понятнее."
+            )
+        if applicant_name and op_name_hits < 2:
+            findings.append(
+                f"Обращение по имени: заявитель определён как «{applicant_name}», "
+                f"но оператор обратился по имени только {op_name_hits} раз(а). По стандарту ЕКЦ нужно обращаться по имени."
+            )
+        if applicant_name and generic_address_matches:
+            findings.append(
+                "Некорректные обращения вместо имени: "
+                f"{self._summarize_phrase_matches(generic_address_matches)} — если имя известно, обращайтесь к заявителю по имени."
+            )
+        if repeated_words:
+            repeated_summary = ", ".join(f'"{word}"×{count}' for word, count in repeated_words)
+            findings.append(
+                f"Речевые повторы: {repeated_summary} — старайтесь разнообразить формулировки и не повторяться."
+            )
+
+        metrics = {
+            "filler_hits": len(filler_matches),
+            "diminutive_hits": len(diminutive_matches),
+            "refusal_hits": len(refusal_matches),
+            "irritant_hits": len(irritant_matches),
+            "overformal_hits": len(overformal_matches),
+            "generic_address_hits": len(generic_address_matches),
+            "repetition_hits": sum(count for _word, count in repeated_words),
+        }
+        return findings, metrics
 
     @staticmethod
     def _clean_name_token(raw: str) -> str:
@@ -2856,25 +3010,21 @@ class CallQualityEvaluator:
         for pat in structured:
             m = re.search(pat, low)
             if m:
-                tok = self._clean_name_token(m.group(1))
-                if (
-                    len(tok) >= 2
-                    and tok not in self._APPLICANT_NAME_STOPWORDS
-                    and re.fullmatch(r"[а-яё-]+", tok, re.IGNORECASE)
-                ):
-                    return self._title_cyrillic_name(tok)
+                candidate = normalize_applicant_name_candidate(m.group(1), max_words=1)
+                if candidate:
+                    return candidate
 
         compact = re.sub(r"\s+", " ", low).strip()
         if len(compact) <= 45 and compact.count(" ") <= 4:
             words = re.findall(r"[а-яё]{2,}", compact)
             words = [w for w in words if w not in self._APPLICANT_NAME_STOPWORDS and len(w) >= 3]
             if len(words) == 1:
-                return self._title_cyrillic_name(words[0])
+                return normalize_applicant_name_candidate(words[0], max_words=1)
             # «Мирослава Строфская.» — оператор обычно называет по имени; сохраняем оба слова для отчёта
             if len(words) == 2:
-                return (
-                    f"{self._title_cyrillic_name(words[0])} "
-                    f"{self._title_cyrillic_name(words[1])}"
+                return normalize_applicant_name_candidate(
+                    f"{words[0]} {words[1]}",
+                    max_words=2,
                 )
         return None
 
@@ -2964,11 +3114,11 @@ class CallQualityEvaluator:
         for name in self._COMMON_NAMES:
             hits = len(re.findall(rf"\b{re.escape(name)}\b", text))
             if hits >= 2:
-                return name[0].upper() + name[1:] if len(name) > 1 else name.upper()
+                return normalize_applicant_name_candidate(name, max_words=1)
             if hits == 1 and len(name) >= 4:
                 # Редкие имена чаще уникальны в реплике заявителя
                 if re.search(rf"(меня\s+зовут|зовут\s+меня|это\s+){re.escape(name)}\b", text):
-                    return name[0].upper() + name[1:] if len(name) > 1 else name.upper()
+                    return normalize_applicant_name_candidate(name, max_words=1)
         return None
 
     def evaluate(
@@ -2976,6 +3126,7 @@ class CallQualityEvaluator:
         transcript: str,
         role_transcript: str,
         forced_operator_name: str | None = None,
+        forced_applicant_name: str | None = None,
     ) -> QualityEvaluation:
         operator_text_raw = self._extract_role_text(role_transcript, "Оператор")
         applicant_text_raw = self._extract_role_text(role_transcript, "Заявитель")
@@ -2987,7 +3138,9 @@ class CallQualityEvaluator:
             operator_text_raw or transcript,
             forced_operator_name,
         )
-        applicant_name = self._find_applicant_name_from_dialog(role_transcript)
+        applicant_name = normalize_applicant_name_candidate(forced_applicant_name or "")
+        if not applicant_name:
+            applicant_name = self._find_applicant_name_from_dialog(role_transcript)
         if not applicant_name and (applicant_text_raw or "").strip():
             applicant_name = self._extract_name_from_applicant_reply(applicant_text_raw)
         applicant_name = applicant_name or self._find_applicant_name(applicant_text_raw or transcript)
@@ -3023,11 +3176,28 @@ class CallQualityEvaluator:
         )
         script_score = min(script_score, 10)
 
-        filler_hits = len(re.findall("|".join(self._FILLER_PATTERNS), operator_text))
-        diminutive_hits = len(re.findall("|".join(self._DIMINUTIVE_PATTERNS), operator_text))
-        negative_hits = len(re.findall("|".join(self._NEGATIVE_PHRASES), operator_text))
-        penalties = filler_hits + (2 * diminutive_hits) + (2 * negative_hits)
-        speech_score = max(0, 10 - penalties)
+        speech_findings, speech_metrics = self._build_speech_and_service_findings(
+            operator_text_raw=operator_text_raw,
+            applicant_name=applicant_name,
+            op_name_hits=op_name_hits,
+        )
+        filler_hits = speech_metrics["filler_hits"]
+        diminutive_hits = speech_metrics["diminutive_hits"]
+        refusal_hits = speech_metrics["refusal_hits"]
+        irritant_hits = speech_metrics["irritant_hits"]
+        overformal_hits = speech_metrics["overformal_hits"]
+        generic_address_hits = speech_metrics["generic_address_hits"]
+        repetition_hits = speech_metrics["repetition_hits"]
+        speech_penalty = (
+            min(4, filler_hits)
+            + min(4, 2 * diminutive_hits)
+            + min(6, 2 * refusal_hits)
+            + min(6, 3 * irritant_hits)
+            + min(2, overformal_hits)
+            + (2 if applicant_name and generic_address_hits else 0)
+            + (1 if repetition_hits >= 4 else 0)
+        )
+        speech_score = max(0, 10 - speech_penalty)
 
         consultation_hits = self._count_pattern_hits(operator_text, self._CONSULTATION_PATTERNS)
         resolution_hits = self._count_pattern_hits(applicant_text or dialog_text, self._RESOLUTION_PATTERNS)
@@ -3076,12 +3246,10 @@ class CallQualityEvaluator:
         else:
             negatives.append("Нарушения по скрипту: проверьте приветствие/представление/завершение.")
 
-        if speech_score >= 8:
+        if speech_score >= 8 and not speech_findings:
             positives.append("Речь оператора чистая, без заметных паразитов и запрещенных формулировок.")
         else:
-            negatives.append(
-                "Есть речевые риски: слова-паразиты/уменьшительные формы/фразы 'к сожалению', 'не знаю'."
-            )
+            negatives.append("Есть речевые риски: проверьте слова-паразиты, обращения и формулировки по стандарту ЕКЦ.")
 
         if consultation_score >= 7:
             positives.append("Консультация предметная, вероятно вопрос заявителя закрыт.")
@@ -3098,6 +3266,14 @@ class CallQualityEvaluator:
             )
         elif not operator_in_staff:
             negatives.append("Имя оператора не из штатного списка (показано как в транскрипте).")
+
+        if applicant_name and not uses_name_checklist:
+            negatives.append(
+                f"Обращение по имени не выполнено: имя заявителя «{applicant_name}» найдено, "
+                f"но по диалогу нет корректного обращения по имени ≥2 раз."
+            )
+
+        negatives.extend(speech_findings)
 
         if not positives:
             positives.append("Сильные стороны слабо выражены в текущем транскрипте.")
@@ -3187,11 +3363,11 @@ def build_report(result: TranscriptionResult, evaluation: QualityEvaluation) -> 
     lines.extend(f"- {item}" for item in evaluation.script_details)
     lines.append("")
     lines.append("Плюсы (кратко):")
-    lines.extend(f"- {item}" for item in evaluation.positives[:3])
+    lines.extend(f"- {item}" for item in evaluation.positives)
     lines.append("")
     lines.append("Минусы (кратко):")
     if evaluation.negatives:
-        lines.extend(f"- {item}" for item in evaluation.negatives[:3])
+        lines.extend(f"- {item}" for item in evaluation.negatives)
     else:
         lines.append("- Явных минусов по текущим критериям не выявлено.")
     lines.append("")
