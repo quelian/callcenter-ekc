@@ -295,6 +295,57 @@ def resolve_ultima_whisper_model() -> str:
     return raw or DEFAULT_ULTIMA_WHISPER_REPO
 
 
+def _resolve_huggingface_cache_repo_dir(model_name: str) -> Path | None:
+    normalized = (model_name or "").strip()
+    if "/" not in normalized or Path(normalized).exists():
+        return None
+    cache_root = (
+        os.environ.get("HF_HUB_CACHE")
+        or os.environ.get("HUGGINGFACE_HUB_CACHE")
+        or str(Path.home() / ".cache" / "huggingface" / "hub")
+    )
+    parts = [part.strip() for part in normalized.split("/") if part.strip()]
+    if len(parts) < 2:
+        return None
+    return Path(cache_root) / f"models--{'--'.join(parts)}"
+
+
+def _safe_dir_size_bytes(path: Path | None) -> int | None:
+    if path is None or not path.exists():
+        return None
+    try:
+        if path.is_file():
+            return int(path.stat().st_size)
+    except OSError:
+        return None
+    total = 0
+    try:
+        for child in path.rglob("*"):
+            try:
+                if child.is_file():
+                    total += int(child.stat().st_size)
+            except OSError:
+                continue
+    except OSError:
+        return None
+    return total
+
+
+def _format_progress_bytes(num_bytes: int | None) -> str:
+    if num_bytes is None or num_bytes < 0:
+        return "неизвестно"
+    units = ("Б", "КиБ", "МиБ", "ГиБ", "ТиБ")
+    value = float(num_bytes)
+    unit = units[0]
+    for unit in units:
+        if value < 1024.0 or unit == units[-1]:
+            break
+        value /= 1024.0
+    if unit == "Б":
+        return f"{int(value)} {unit}"
+    return f"{value:.1f} {unit}"
+
+
 _punct_deepmulti_compat_applied = False
 
 
@@ -1894,6 +1945,9 @@ class Transcriber:
             + ", ".join(f"{d}/{c}" for d, c in attempts[:8])
             + ("…" if len(attempts) > 8 else "")
         )
+        cache_repo_dir = _resolve_huggingface_cache_repo_dir(effective_model)
+        if cache_repo_dir is not None:
+            self._log(f"[asr] Кэш Hugging Face для модели: {cache_repo_dir}")
 
         last_error: Exception | None = None
         for device, ctype in attempts:
@@ -1916,13 +1970,78 @@ class Transcriber:
 
             thread = threading.Thread(target=_load_model, daemon=True)
             thread.start()
-            thread.join(timeout=self.model_load_timeout_seconds)
-            if thread.is_alive():
-                self._log(
-                    "[asr] Достигнут лимит ожидания загрузки; жду завершения потока "
-                    "без запуска второй параллельной загрузки…"
+            started_at = time.monotonic()
+            next_heartbeat_at = started_at + 15.0
+            last_observed_cache_bytes = _safe_dir_size_bytes(cache_repo_dir)
+            last_progress_at = started_at
+            timeout_notice_emitted = False
+            stall_notice_emitted = False
+            while thread.is_alive():
+                now = time.monotonic()
+                elapsed = now - started_at
+                timeout_budget = float(self.model_load_timeout_seconds)
+                if elapsed >= timeout_budget:
+                    if not timeout_notice_emitted:
+                        self._log(
+                            "[asr] Достигнут лимит ожидания загрузки; вторую параллельную "
+                            "загрузку не запускаю, продолжаю ждать текущую и показывать heartbeat…"
+                        )
+                        timeout_notice_emitted = True
+                    join_timeout = 30.0
+                else:
+                    join_timeout = min(5.0, timeout_budget - elapsed)
+                thread.join(timeout=max(0.5, join_timeout))
+                if not thread.is_alive():
+                    break
+
+                now = time.monotonic()
+                elapsed = now - started_at
+                should_refresh_cache = cache_repo_dir is not None and now >= next_heartbeat_at
+                current_cache_bytes = (
+                    _safe_dir_size_bytes(cache_repo_dir)
+                    if should_refresh_cache
+                    else last_observed_cache_bytes
                 )
-                thread.join()
+                if should_refresh_cache and current_cache_bytes is not None:
+                    if (
+                        last_observed_cache_bytes is None
+                        or current_cache_bytes > last_observed_cache_bytes
+                    ):
+                        last_progress_at = now
+                        stall_notice_emitted = False
+                elif should_refresh_cache and last_observed_cache_bytes is None and elapsed < 90.0:
+                    last_progress_at = now
+
+                if now >= next_heartbeat_at:
+                    message = (
+                        f"[asr] Всё ещё загружаю {effective_model} ({device}/{ctype}); "
+                        f"прошло {int(elapsed)} с"
+                    )
+                    if current_cache_bytes is not None:
+                        message += f", кэш ~{_format_progress_bytes(current_cache_bytes)}"
+                        if (
+                            last_observed_cache_bytes is not None
+                            and current_cache_bytes > last_observed_cache_bytes
+                        ):
+                            delta = current_cache_bytes - last_observed_cache_bytes
+                            message += f" (+{_format_progress_bytes(delta)})"
+                    self._log(message + ".")
+                    next_heartbeat_at = now + (30.0 if timeout_notice_emitted else 15.0)
+
+                if (
+                    cache_repo_dir is not None
+                    and not stall_notice_emitted
+                    and now - last_progress_at >= 120.0
+                ):
+                    self._log(
+                        "[asr] Кэш модели давно не растёт. Похоже, загрузка застопорилась: "
+                        "проверьте доступ к huggingface.co, VPN/прокси, место на диске или "
+                        "временно переключитесь на «Стандарт»."
+                    )
+                    stall_notice_emitted = True
+
+                if should_refresh_cache:
+                    last_observed_cache_bytes = current_cache_bytes
             if "model" in model_box:
                 self._model = model_box["model"]
                 self._stage("ASR-модель", f"готова: device={device}, compute_type={ctype}")

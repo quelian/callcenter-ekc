@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from transcription import (
     PreparedAudioDiagnostics,
+    _format_progress_bytes,
+    _resolve_huggingface_cache_repo_dir,
     should_retry_ultima_full_decode,
     should_use_fast_ultima_decode,
 )
@@ -72,3 +74,15 @@ def test_should_keep_fast_ultima_result_when_density_is_normal() -> None:
 
     assert not retry
     assert reason == ""
+
+
+def test_resolve_huggingface_cache_repo_dir_for_repo_id() -> None:
+    path = _resolve_huggingface_cache_repo_dir("bzikst/faster-whisper-large-v3-russian")
+
+    assert path is not None
+    assert path.name == "models--bzikst--faster-whisper-large-v3-russian"
+
+
+def test_format_progress_bytes_uses_human_readable_units() -> None:
+    assert _format_progress_bytes(512) == "512 Б"
+    assert _format_progress_bytes(1536) == "1.5 КиБ"
