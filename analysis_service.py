@@ -14,7 +14,7 @@ from transcription import (
 )
 
 if TYPE_CHECKING:
-    from llm_cloud_eval import YandexCloudConfig
+    from llm_cloud_eval import CloudEvalConfig
 
 
 @dataclass(frozen=True)
@@ -36,9 +36,13 @@ class TranscriberSettings:
     llm_yandex_api_key: str | None = None
     llm_yandex_folder_id: str | None = None
     llm_yandex_model: str = "yandexgpt-lite"
+    llm_claude_api_key: str | None = None
+    llm_claude_base_url: str | None = None
+    llm_claude_model: str | None = None
     language: str = "ru"
     model_load_timeout_seconds: int = 600
     total_time_budget_seconds: int = 300
+    asr_backend: str = "whisper"  # "whisper" | "assemblyai"
 
 
 @dataclass(frozen=True)
@@ -47,7 +51,7 @@ class AnalysisRequest:
     operator_name: str | None = None
     original_basename: str | None = None
     skip_first_seconds: float | None = None
-    cloud_eval_cfg: "YandexCloudConfig | None" = None
+    cloud_eval_cfg: "CloudEvalConfig | None" = None
     cloud_eval_extra_instructions: str | None = None
 
 
@@ -97,6 +101,7 @@ def create_transcriber(settings: TranscriberSettings) -> Transcriber:
         llm_yandex_api_key=settings.llm_yandex_api_key,
         llm_yandex_folder_id=settings.llm_yandex_folder_id,
         llm_yandex_model=settings.llm_yandex_model,
+        asr_backend=settings.asr_backend,
     )
 
 

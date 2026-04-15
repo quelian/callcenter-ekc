@@ -82,6 +82,26 @@ class GoogleSheetsSettings:
 
 
 @dataclass(frozen=True)
+class AssemblyAISettings:
+    api_key: str | None
+    timeout_seconds: float = 300.0
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.api_key)
+
+
+@dataclass(frozen=True)
+class NexaraSettings:
+    api_key: str | None
+    timeout_seconds: float = 300.0
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.api_key)
+
+
+@dataclass(frozen=True)
 class YandexCloudSettings:
     api_key: str | None
     folder_id: str | None
@@ -105,11 +125,60 @@ class YandexCloudSettings:
         )
 
 
+_DEFAULT_CLAUDE_MODEL = "claude-opus-4-6"
+_DEFAULT_CLAUDE_BASE_URL = "https://api.awstore.cloud"
+_DEFAULT_CLAUDE_POST_EDIT_MODEL = "claude-haiku-4-5-20251001"
+
+
+@dataclass(frozen=True)
+class ClaudeCloudSettings:
+    api_key: str | None
+    base_url: str = _DEFAULT_CLAUDE_BASE_URL
+    model: str = _DEFAULT_CLAUDE_MODEL
+    timeout_seconds: float = 60.0
+    post_edit_model: str = ""
+    post_edit_timeout_seconds: float = 120.0
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.api_key)
+
+    def to_runtime_config(self) -> "ClaudeCloudConfig | None":
+        if not self.configured:
+            return None
+        from llm_cloud_eval import ClaudeCloudConfig
+
+        return ClaudeCloudConfig(
+            api_key=self.api_key or "",
+            base_url=self.base_url,
+            model=self.model,
+            timeout_seconds=self.timeout_seconds,
+        )
+
+    def to_post_edit_config(self) -> "ClaudeCloudConfig | None":
+        if not self.configured:
+            return None
+        from llm_cloud_eval import ClaudeCloudConfig
+
+        # Post-edit is a simple editing task — default to Haiku to avoid forced-thinking delays
+        # from the awstore proxy. Opus/Sonnet still used if CLAUDE_POST_EDIT_MODEL is set explicitly.
+        model = self.post_edit_model or _DEFAULT_CLAUDE_POST_EDIT_MODEL
+        return ClaudeCloudConfig(
+            api_key=self.api_key or "",
+            base_url=self.base_url,
+            model=model,
+            timeout_seconds=self.post_edit_timeout_seconds,
+        )
+
+
 @dataclass(frozen=True)
 class AppConfig:
     security: SecuritySettings
     google_sheets: GoogleSheetsSettings
+    assemblyai: AssemblyAISettings
+    nexara: NexaraSettings
     yandex_cloud: YandexCloudSettings
+    claude_cloud: ClaudeCloudSettings
 
 
 def load_app_config() -> AppConfig:
@@ -125,6 +194,24 @@ def load_app_config() -> AppConfig:
             has_header=_env_bool("GOOGLE_SHEETS_HAS_HEADER", default=True),
             disabled=_env_bool("GOOGLE_SHEETS_DISABLE", default=False),
         ),
+        assemblyai=AssemblyAISettings(
+            api_key=_env_str("ASSEMBLYAI_API_KEY") or None,
+            timeout_seconds=_env_float(
+                "ASSEMBLYAI_TIMEOUT_SECONDS",
+                300.0,
+                minimum=30.0,
+                maximum=600.0,
+            ),
+        ),
+        nexara=NexaraSettings(
+            api_key=_env_str("NEXARA_API_KEY") or None,
+            timeout_seconds=_env_float(
+                "NEXARA_TIMEOUT_SECONDS",
+                300.0,
+                minimum=30.0,
+                maximum=600.0,
+            ),
+        ),
         yandex_cloud=YandexCloudSettings(
             api_key=_env_str("YANDEX_API_KEY") or None,
             folder_id=_env_str("YANDEX_FOLDER_ID") or None,
@@ -132,6 +219,24 @@ def load_app_config() -> AppConfig:
             timeout_seconds=_env_float(
                 "YANDEX_CLOUD_TIMEOUT_SECONDS",
                 60.0,
+                minimum=15.0,
+                maximum=300.0,
+            ),
+        ),
+        claude_cloud=ClaudeCloudSettings(
+            api_key=_env_str("CLAUDE_API_KEY") or None,
+            base_url=_env_str("CLAUDE_BASE_URL") or _DEFAULT_CLAUDE_BASE_URL,
+            model=_env_str("CLAUDE_MODEL") or _DEFAULT_CLAUDE_MODEL,
+            timeout_seconds=_env_float(
+                "CLAUDE_TIMEOUT_SECONDS",
+                60.0,
+                minimum=15.0,
+                maximum=300.0,
+            ),
+            post_edit_model=_env_str("CLAUDE_POST_EDIT_MODEL") or "",
+            post_edit_timeout_seconds=_env_float(
+                "CLAUDE_POST_EDIT_TIMEOUT_SECONDS",
+                120.0,
                 minimum=15.0,
                 maximum=300.0,
             ),

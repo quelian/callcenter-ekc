@@ -1,7 +1,21 @@
 from __future__ import annotations
 
 import os
+import ssl
 import sys
+
+# Глобально отключаем проверку SSL-сертификатов — нужно для api.awstore.cloud
+# и других внешних API с self-signed сертификатами.
+# Патчим ДО любого импорта, который может создать SSL-контекст.
+
+def _make_insecure_context():
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+ssl._create_default_https_context = _make_insecure_context
+ssl.create_default_context = _make_insecure_context
 
 # macOS: при спавне воркеров Streamlit/lib в stderr сыпется
 # «MallocStackLogging: can't turn off...» — задаём режим malloc до нативных импортов.
@@ -161,20 +175,26 @@ header[data-testid="stHeader"]     { display: none !important; }
     max-width: 1140px !important;
 }
 
+/* ── Scrollbar ── */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #d1d5db; border-radius: 9999px; }
+::-webkit-scrollbar-thumb:hover { background: #9ca3af; }
+
 /* ── Шапка ── */
 .qa-header {
-    display: flex; align-items: center; gap: 14px;
-    padding: 0 0 20px 0; border-bottom: 1px solid #f0f0f0; margin-bottom: 24px;
+    display: flex; align-items: center; gap: 16px;
+    padding: 0 0 24px 0; border-bottom: 2px solid #e5e7eb; margin-bottom: 28px;
 }
 .qa-header-icon {
-    background: linear-gradient(135deg, #2563eb, #1d4ed8);
-    border-radius: 14px; width: 48px; height: 48px;
+    background: linear-gradient(135deg, #2563eb, #1e40af);
+    border-radius: 16px; width: 52px; height: 52px;
     display: flex; align-items: center; justify-content: center;
-    font-size: 24px; box-shadow: 0 4px 12px rgba(37,99,235,.25);
+    font-size: 26px; box-shadow: 0 6px 16px rgba(37,99,235,.3);
     flex-shrink: 0;
 }
-.qa-header-title { font-size: 22px; font-weight: 800; color: #111; line-height: 1.2; }
-.qa-header-sub   { font-size: 13px; color: #9ca3af; margin-top: 2px; }
+.qa-header-title { font-size: 24px; font-weight: 800; color: #0f172a; line-height: 1.2; }
+.qa-header-sub   { font-size: 13px; color: #64748b; margin-top: 3px; font-weight: 500; }
 
 /* ── Сайдбар — принудительно видимый ── */
 section[data-testid="stSidebar"],
@@ -197,112 +217,116 @@ section[data-testid="stSidebar"] > div {
     display: none !important;
 }
 .sidebar-logo {
-    display: flex; align-items: center; gap: 10px;
-    padding: 4px 0 16px 0; border-bottom: 1px solid #e5e7eb; margin-bottom: 16px;
+    display: flex; align-items: center; gap: 12px;
+    padding: 0 0 16px 0; border-bottom: 1px solid #e2e8f0; margin-bottom: 20px;
 }
 .sidebar-logo-icon {
-    background: linear-gradient(135deg, #2563eb, #1d4ed8);
-    border-radius: 10px; width: 36px; height: 36px;
-    display: flex; align-items: center; justify-content: center; font-size: 18px;
+    background: linear-gradient(135deg, #2563eb, #1e40af);
+    border-radius: 12px; width: 40px; height: 40px;
+    display: flex; align-items: center; justify-content: center; font-size: 20px;
+    box-shadow: 0 2px 8px rgba(37,99,235,.2);
 }
-.sidebar-logo-text { font-size: 14px; font-weight: 700; color: #111; }
-.sidebar-logo-sub  { font-size: 11px; color: #9ca3af; }
-.sidebar-logo-version { font-size: 10px; color: #cbd5e1; margin-top: 2px; }
+.sidebar-logo-text { font-size: 15px; font-weight: 700; color: #0f172a; }
+.sidebar-logo-sub  { font-size: 12px; color: #64748b; font-weight: 500; }
+.sidebar-logo-version { font-size: 11px; color: #94a3b8; margin-top: 2px; }
 
 .ai-connected {
-    background: #f0fdf4; border: 1px solid #bbf7d0;
-    border-radius: 10px; padding: 10px 14px;
-    font-size: 13px; color: #166534; margin-bottom: 12px;
-    display: flex; align-items: center; gap: 8px;
+    background: linear-gradient(135deg, #f0fdf4, #ecfdf5); border: 1px solid #bbf7d0;
+    border-radius: 8px; padding: 8px 12px;
+    font-size: 12px; color: #15803d; margin-bottom: 14px;
+    display: flex; align-items: center; gap: 6px; font-weight: 500;
 }
 .ai-disconnected {
-    background: #fff7ed; border: 1px solid #fed7aa;
-    border-radius: 10px; padding: 10px 14px;
-    font-size: 13px; color: #9a3412; margin-bottom: 12px;
-    display: flex; align-items: center; gap: 8px;
+    background: linear-gradient(135deg, #fff7ed, #fffbeb); border: 1px solid #fed7aa;
+    border-radius: 8px; padding: 8px 12px;
+    font-size: 12px; color: #c2410c; margin-bottom: 14px;
+    display: flex; align-items: center; gap: 6px; font-weight: 500;
 }
 
 /* ── Шаговый прогресс ── */
 .steps-bar {
     display: flex; align-items: center;
-    background: #f9fafb; border: 1px solid #f0f0f0;
-    border-radius: 14px; padding: 14px 20px; margin: 16px 0; gap: 0;
+    background: #f8fafc; border: 1px solid #e2e8f0;
+    border-radius: 16px; padding: 16px 24px; margin: 18px 0; gap: 0;
+    box-shadow: 0 1px 3px rgba(0,0,0,.03);
 }
 .step {
-    display: flex; align-items: center; gap: 8px;
+    display: flex; align-items: center; gap: 10px;
     flex: 1; justify-content: center; position: relative;
 }
 .step:not(:last-child)::after {
     content: ''; position: absolute; right: 0;
-    width: 1px; height: 28px; background: #e5e7eb;
+    width: 1px; height: 32px; background: #e2e8f0;
 }
 .step-dot {
-    width: 28px; height: 28px; border-radius: 9999px;
+    width: 32px; height: 32px; border-radius: 9999px;
     display: flex; align-items: center; justify-content: center;
-    font-size: 12px; font-weight: 700; flex-shrink: 0;
+    font-size: 13px; font-weight: 700; flex-shrink: 0;
 }
 .step-dot.done  { background: #dcfce7; color: #16a34a; }
 .step-dot.active{ background: #dbeafe; color: #2563eb; animation: pulse 1.5s infinite; }
-.step-dot.idle  { background: #f3f4f6; color: #9ca3af; }
+.step-dot.idle  { background: #f1f5f9; color: #94a3b8; }
 .step-label { font-size: 12px; font-weight: 500; }
 .step-label.done  { color: #16a34a; }
 .step-label.active{ color: #2563eb; }
-.step-label.idle  { color: #9ca3af; }
+.step-label.idle  { color: #94a3b8; }
 
 @keyframes pulse {
-    0%,100%{ box-shadow: 0 0 0 0 rgba(37,99,235,.3); }
-    50%    { box-shadow: 0 0 0 6px rgba(37,99,235,.0); }
+    0%,100%{ box-shadow: 0 0 0 0 rgba(37,99,235,.25); }
+    50%    { box-shadow: 0 0 0 8px rgba(37,99,235,.0); }
 }
 
 /* ── Карточки счётчиков ── */
 .score-card {
-    background: #fff; border: 1px solid #f0f0f0; border-radius: 14px;
-    padding: 16px; text-align: center;
-    box-shadow: 0 1px 4px rgba(0,0,0,.05);
-    transition: box-shadow .2s;
+    background: #fff; border: 1px solid #e5e7eb; border-radius: 16px;
+    padding: 20px 16px 16px; text-align: center;
+    box-shadow: 0 1px 3px rgba(0,0,0,.04), 0 1px 2px rgba(0,0,0,.06);
+    transition: transform .15s ease, box-shadow .2s ease;
 }
-.score-card:hover { box-shadow: 0 4px 16px rgba(0,0,0,.09); }
-.score-title { font-size: 12px; color: #6b7280; font-weight: 500;
-               text-transform: uppercase; letter-spacing: .05em; margin-bottom: 8px; }
-.score-value { font-size: 36px; font-weight: 900; line-height: 1; }
-.score-sub   { font-size: 13px; color: #9ca3af; margin-top: 2px; }
-.score-bar   { height: 5px; border-radius: 9999px; background: #f3f4f6;
-               margin-top: 10px; overflow: hidden; }
-.score-fill  { height: 100%; border-radius: 9999px; transition: width .4s; }
+.score-card:hover { transform: translateY(-2px); box-shadow: 0 6px 20px rgba(0,0,0,.08); }
+.score-title { font-size: 11px; color: #64748b; font-weight: 600;
+               text-transform: uppercase; letter-spacing: .06em; margin-bottom: 10px; }
+.score-value { font-size: 40px; font-weight: 900; line-height: 1; }
+.score-sub   { font-size: 13px; color: #94a3b8; margin-top: 2px; }
+.score-bar   { height: 6px; border-radius: 9999px; background: #f1f5f9;
+               margin-top: 12px; overflow: hidden; }
+.score-fill  { height: 100%; border-radius: 9999px; transition: width .5s ease; }
 .score-badge { display:inline-block; font-size:11px; font-weight:600;
-               border-radius:6px; padding:2px 8px; margin-top:8px; }
+               border-radius:6px; padding:3px 10px; margin-top:10px; }
 
 /* ── Summary ── */
 .summary-card {
-    background: #fff; border: 1px solid #f0f0f0; border-radius: 18px;
-    padding: 24px 28px; margin-bottom: 20px;
-    box-shadow: 0 2px 8px rgba(0,0,0,.06);
+    background: #fff; border: 1px solid #e5e7eb; border-radius: 20px;
+    padding: 24px 32px; margin-bottom: 24px;
+    box-shadow: 0 2px 12px rgba(0,0,0,.04), 0 1px 3px rgba(0,0,0,.06);
     display: flex; align-items: center; justify-content: space-between;
     flex-wrap: wrap; gap: 20px;
 }
 .summary-person-label {
-    font-size: 11px; color: #9ca3af; text-transform: uppercase;
-    letter-spacing: .06em; margin-bottom: 4px;
+    font-size: 11px; color: #64748b; text-transform: uppercase;
+    letter-spacing: .06em; margin-bottom: 6px; font-weight: 600;
 }
 .summary-person-name {
-    font-size: 20px; font-weight: 700; color: #111;
+    font-size: 20px; font-weight: 700; color: #0f172a;
 }
 .summary-score-wrap { text-align: right; }
 .summary-score-label {
-    font-size: 11px; color: #9ca3af; text-transform: uppercase;
-    letter-spacing: .06em; margin-bottom: 4px;
+    font-size: 11px; color: #64748b; text-transform: uppercase;
+    letter-spacing: .06em; margin-bottom: 6px; font-weight: 600;
 }
 .summary-score-val {
-    font-size: 54px; font-weight: 900; line-height: 1;
+    font-size: 56px; font-weight: 900; line-height: 1;
 }
-.summary-score-denom { font-size: 22px; color: #d1d5db; }
+.summary-score-denom { font-size: 24px; color: #cbd5e1; }
 
 /* ── Чеклист ── */
 .checklist-item {
     display: flex; align-items: center; gap: 10px;
-    padding: 10px 14px; border-radius: 10px; margin-bottom: 6px;
+    padding: 12px 14px; border-radius: 10px; margin-bottom: 6px;
     font-size: 14px; font-weight: 500;
+    transition: transform .1s ease;
 }
+.checklist-item:hover { transform: translateX(2px); }
 .checklist-item.ok  { background: #f0fdf4; color: #166534; }
 .checklist-item.fail{ background: #fef2f2; color: #991b1b; }
 .checklist-icon { font-size: 16px; flex-shrink: 0; }
@@ -310,60 +334,102 @@ section[data-testid="stSidebar"] > div {
 /* ── Плюсы / минусы ── */
 .feedback-item {
     border-radius: 12px; padding: 12px 16px; margin-bottom: 8px;
-    font-size: 14px; line-height: 1.5;
+    font-size: 14px; line-height: 1.6;
 }
 .feedback-item.pos { background: #f0fdf4; border-left: 4px solid #22c55e; color: #166534; }
 .feedback-item.neg { background: #fff7ed; border-left: 4px solid #f59e0b; color: #92400e; }
 
 /* ── Транскрипт ── */
 .transcript-wrap {
-    background: #fafafa; border: 1px solid #f0f0f0; border-radius: 14px;
+    background: #fafafa; border: 1px solid #e5e7eb; border-radius: 14px;
     padding: 16px; max-height: 480px; overflow-y: auto; font-size: 14px;
 }
-.tx-line { display: flex; gap: 10px; margin-bottom: 10px; }
+.tx-line { display: flex; gap: 12px; margin-bottom: 10px; }
 .tx-badge {
     flex-shrink: 0; font-size: 10px; font-weight: 700; border-radius: 6px;
-    padding: 2px 8px; height: fit-content; margin-top: 2px; letter-spacing: .04em;
+    padding: 3px 10px; height: fit-content; margin-top: 2px; letter-spacing: .04em;
     white-space: nowrap;
 }
 .tx-badge.op  { background: #dbeafe; color: #1d4ed8; }
-.tx-badge.ap  { background: #f3f4f6; color: #374151; }
-.tx-text { color: #374151; line-height: 1.6; }
+.tx-badge.ap  { background: #f1f5f9; color: #475569; }
+.tx-text { color: #334155; line-height: 1.65; }
 
 /* ── Verdict ── */
 .verdict-ok  {
-    background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 12px;
-    padding: 14px 18px; color: #166534; font-size: 15px; font-weight: 600;
+    background: linear-gradient(135deg, #f0fdf4, #ecfdf5); border: 1px solid #bbf7d0; border-radius: 12px;
+    padding: 16px 20px; color: #15803d; font-size: 15px; font-weight: 600;
     display: flex; align-items: center; gap: 10px; margin-bottom: 20px;
+    box-shadow: 0 1px 3px rgba(0,0,0,.04);
 }
 .verdict-bad {
-    background: #fef2f2; border: 1px solid #fecaca; border-radius: 12px;
-    padding: 14px 18px; color: #991b1b; font-size: 15px; font-weight: 600;
+    background: linear-gradient(135deg, #fef2f2, #fff1f2); border: 1px solid #fecaca; border-radius: 12px;
+    padding: 16px 20px; color: #b91c1c; font-size: 15px; font-weight: 600;
     display: flex; align-items: center; gap: 10px; margin-bottom: 20px;
+    box-shadow: 0 1px 3px rgba(0,0,0,.04);
 }
 .verdict-reasons { font-size: 13px; font-weight: 400; color: #b91c1c; margin-top: 4px; }
 
 /* ── Секции ── */
 .section-title {
-    font-size: 16px; font-weight: 700; color: #111;
-    margin: 24px 0 12px 0; display: flex; align-items: center; gap: 8px;
+    font-size: 17px; font-weight: 700; color: #0f172a;
+    margin: 28px 0 14px 0; display: flex; align-items: center; gap: 8px;
 }
 
 /* ── Пакетный режим — прогресс-файл ── */
 .batch-file-card {
-    background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 10px;
-    padding: 10px 14px; margin-bottom: 8px; font-size: 13px; color: #374151;
+    background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 10px;
+    padding: 12px 14px; margin-bottom: 8px; font-size: 13px; color: #475569;
     display: flex; align-items: center; gap: 10px;
+    transition: box-shadow .15s ease;
 }
+.batch-file-card:hover { box-shadow: 0 2px 8px rgba(0,0,0,.06); }
 .batch-file-card.ok  { border-left: 4px solid #22c55e; }
 .batch-file-card.err { border-left: 4px solid #ef4444; }
 .batch-review-yes {
     background: #fef2f2; color: #991b1b; font-weight: 600;
-    border-radius: 5px; padding: 2px 8px; font-size: 12px;
+    border-radius: 6px; padding: 3px 8px; font-size: 12px;
 }
 .batch-review-no {
     background: #f0fdf4; color: #166534; font-weight: 600;
-    border-radius: 5px; padding: 2px 8px; font-size: 12px;
+    border-radius: 6px; padding: 3px 8px; font-size: 12px;
+}
+
+/* ── Streamlit element refinements ── */
+/* Expander bodies with subtle border */
+.streamlit-expander-header { border-radius: 8px !important; }
+[data-baseweb="Disclosure"] [data-baseweb="Panel"] {
+    border-radius: 0 0 10px 10px !important;
+}
+
+/* Buttons: slightly more prominent primary */
+.stButton button[kind="primary"] {
+    border-radius: 10px !important;
+    font-weight: 600 !important;
+    transition: transform .1s ease, box-shadow .15s ease !important;
+}
+.stButton button[kind="primary"]:hover {
+    transform: translateY(-1px) !important;
+    box-shadow: 0 4px 12px rgba(37,99,235,.25) !important;
+}
+.stButton button[kind="secondary"] {
+    border-radius: 10px !important;
+    font-weight: 500 !important;
+}
+
+/* File uploader: cleaner look */
+[data-testid="stFileUploader"] {
+    border-radius: 12px !important;
+}
+
+/* SelectBox and text inputs: slightly rounder */
+input[type="text"], [data-baseweb="Select"] {
+    border-radius: 8px !important;
+}
+
+/* Tab styling */
+[data-baseweb="Tab"] {
+    font-weight: 500 !important;
+    border-radius: 8px 8px 0 0 !important;
 }
 </style>
 """
@@ -393,11 +459,23 @@ def _build_gui_transcriber_settings(
     enable_post_edit: bool,
     post_edit_timeout_seconds: int,
     enable_llm_post_edit: bool,
+    llm_backend: str,
     llm_yandex_api_key: str | None,
     llm_yandex_folder_id: str | None,
     llm_yandex_model: str,
     llm_yandex_timeout: float,
+    llm_claude_api_key: str | None = None,
+    llm_claude_base_url: str | None = None,
+    llm_claude_model: str | None = None,
+    asr_backend: str = "whisper",
 ) -> TranscriberSettings:
+    # For post-edit: prefer Yandex (no forced-thinking delay) when both are configured.
+    # The awstore proxy forces thinking mode on all Claude models regardless of the
+    # "thinking: disabled" parameter, causing 60–95 s delays. Yandex has no such issue.
+    effective_llm_backend = llm_backend
+    if enable_llm_post_edit and llm_backend == "claude" and llm_yandex_api_key and llm_yandex_folder_id:
+        effective_llm_backend = "yandex"
+
     return TranscriberSettings(
         model_name=model_name,
         compute_type=compute_type,
@@ -407,11 +485,15 @@ def _build_gui_transcriber_settings(
         enable_post_edit=enable_post_edit,
         post_edit_timeout_seconds=post_edit_timeout_seconds,
         enable_llm_post_edit=enable_llm_post_edit,
-        llm_backend="yandex" if enable_llm_post_edit else "off",
+        llm_backend=effective_llm_backend if enable_llm_post_edit else "off",
         llm_yandex_api_key=llm_yandex_api_key,
         llm_yandex_folder_id=llm_yandex_folder_id,
         llm_yandex_model=llm_yandex_model,
         llm_post_edit_timeout_seconds=float(llm_yandex_timeout),
+        llm_claude_api_key=llm_claude_api_key,
+        llm_claude_base_url=llm_claude_base_url,
+        llm_claude_model=llm_claude_model,
+        asr_backend=asr_backend,
     )
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -449,7 +531,7 @@ def main() -> None:
     sidebar_state = render_sidebar(APP_VERSION_LABEL, APP_VERSION_DATE)
 
     cloud_mode_active = (
-        sidebar_state.use_yandex and sidebar_state.cloud_eval_cfg is not None
+        sidebar_state.cloud_backend != "off" and sidebar_state.cloud_eval_cfg is not None
     )
     enable_llm_post_edit = cloud_mode_active
 
@@ -496,6 +578,7 @@ def main() -> None:
             enable_post_edit=sidebar_state.enable_post_edit,
             cloud_eval_cfg=sidebar_state.cloud_eval_cfg,
             cloud_mode_active=cloud_mode_active,
+            sidebar_state=sidebar_state,
         )
 
     with tab_single:
@@ -512,6 +595,7 @@ def main() -> None:
             cloud_mode_active=cloud_mode_active,
             cloud_eval_cfg=sidebar_state.cloud_eval_cfg,
             enable_llm_post_edit=enable_llm_post_edit,
+            sidebar_state=sidebar_state,
         )
 # ── Single file tab ───────────────────────────────────────────────────────────
 
@@ -528,6 +612,7 @@ def _render_single_tab(
     cloud_mode_active: bool,
     cloud_eval_cfg,
     enable_llm_post_edit: bool,
+    sidebar_state,
 ) -> None:
     col_file, col_op = st.columns([3, 1])
     with col_file:
@@ -737,6 +822,13 @@ def _render_single_tab(
                     if _skip_total > 0:
                         skip_from_manual = float(_skip_total)
 
+                from llm_cloud_eval import YandexCloudConfig
+
+                _is_yandex = isinstance(cloud_eval_cfg, YandexCloudConfig)
+                # Always fetch Yandex credentials from app_config so post-edit can route
+                # to Yandex (fast) even when Claude is the primary evaluation backend.
+                _app_cfg = load_app_config()
+                _yandex_cfg = _app_cfg.yandex_cloud
                 transcriber_settings = _build_gui_transcriber_settings(
                     model_name=model_name,
                     compute_type=compute_type,
@@ -746,10 +838,12 @@ def _render_single_tab(
                     enable_post_edit=enable_post_edit,
                     post_edit_timeout_seconds=60,
                     enable_llm_post_edit=enable_llm_post_edit,
-                    llm_yandex_api_key=cloud_eval_cfg.api_key if cloud_eval_cfg else None,
-                    llm_yandex_folder_id=cloud_eval_cfg.folder_id if cloud_eval_cfg else None,
-                    llm_yandex_model=cloud_eval_cfg.model if cloud_eval_cfg else "yandexgpt-lite",
-                    llm_yandex_timeout=cloud_eval_cfg.timeout_seconds if cloud_eval_cfg else 60.0,
+                    llm_backend=sidebar_state.cloud_backend,
+                    llm_yandex_api_key=_yandex_cfg.api_key if _yandex_cfg.configured else None,
+                    llm_yandex_folder_id=_yandex_cfg.folder_id if _yandex_cfg.configured else None,
+                    llm_yandex_model=_yandex_cfg.model,
+                    llm_yandex_timeout=_yandex_cfg.timeout_seconds,
+                    asr_backend=sidebar_state.asr_backend,
                 )
                 analysis = analyze_call(
                     AnalysisRequest(
@@ -773,7 +867,9 @@ def _render_single_tab(
             except Exception as exc:
                 progress.progress(100, text="Ошибка")
                 eta_placeholder.empty()
+                import traceback
                 st.error(f"Произошла ошибка: {exc}")
+                st.code(traceback.format_exc())
                 return
     finally:
         _stop_timer.set()
@@ -895,15 +991,16 @@ def render_batch_tab(
     enable_post_edit: bool,
     cloud_eval_cfg,
     cloud_mode_active: bool,
+    sidebar_state,
 ) -> None:
     """Рендерит вкладку пакетной обработки."""
     st.markdown(
         '<div class="section-title">📁 Пакетная обработка звонков</div>',
         unsafe_allow_html=True,
     )
-    st.caption(
-        "Загрузите несколько аудиофайлов — они будут обработаны по очереди. "
-        "Укажите оператора: все записи в пакете считаются звонками одного оператора (автоопределения нет)."
+    st.info(
+        "Загрузите несколько аудиофайлов с именами в формате **ДД-ММ-ГГГГ_телефон_MM-СС**. "
+        "Все файлы обрабатываются последовательно с одинаковыми настройками."
     )
 
     from sheets_export import (
@@ -996,7 +1093,7 @@ def render_batch_tab(
     )
 
     if not uploaded_files and not resume_batch:
-        st.info("Выберите один или несколько аудиофайлов для начала.")
+        st.info("Загрузите файлы с именами в формате ДД-ММ-ГГГГ_телефон_MM-СС — они будут обработаны последовательно.")
         return
 
     valid_batch_files = [f for f in (uploaded_files or []) if is_standard_call_filename(f.name)]
@@ -1050,6 +1147,9 @@ def render_batch_tab(
     if "batch_errors" not in st.session_state:
         st.session_state["batch_errors"] = {}
 
+    if valid_batch_files and batch_operator_resolved is None and not resume_batch:
+        st.warning("Выберите оператора из списка, чтобы запустить пакетный анализ.")
+
     btn_col1, btn_col2 = st.columns([4, 1])
     _can_start_batch = bool(valid_batch_files) and batch_operator_resolved is not None
     with btn_col1:
@@ -1060,8 +1160,6 @@ def render_batch_tab(
             key="batch_start",
             disabled=not _can_start_batch,
         )
-    if valid_batch_files and batch_operator_resolved is None and not resume_batch:
-        st.warning("Выберите оператора из списка, чтобы запустить пакетный анализ.")
     with btn_col2:
         if st.button("🗑 Очистить", width="stretch", key="batch_clear"):
             st.session_state["batch_results"] = []
@@ -1080,7 +1178,7 @@ def render_batch_tab(
                 "строже к срокам ответа…"
             ),
             help=(
-                "Текст добавляется к системному промпту **облачной оценки** (Yandex) для **каждого** файла "
+                "Текст добавляется к системному промпту **облачной оценки** для **каждого** файла "
                 "в пакете. Не меняет распознавание речи. При «Продолжить незавершённый пакет» "
                 "используются инструкции, сохранённые при старте пакета."
             ),
@@ -1173,6 +1271,10 @@ def render_batch_tab(
             batch_live_logs_placeholder = st.empty()
 
         total = len(file_jobs)
+        # Always fetch Yandex credentials from app_config so post-edit can route
+        # to Yandex (fast) even when Claude is the primary evaluation backend.
+        _app_cfg = load_app_config()
+        _yandex_cfg = _app_cfg.yandex_cloud
         transcriber_settings = _build_gui_transcriber_settings(
             model_name=model_name,
             compute_type=compute_type,
@@ -1182,10 +1284,12 @@ def render_batch_tab(
             enable_post_edit=enable_post_edit,
             post_edit_timeout_seconds=60,
             enable_llm_post_edit=cloud_mode_active,
-            llm_yandex_api_key=cloud_eval_cfg.api_key if cloud_eval_cfg else None,
-            llm_yandex_folder_id=cloud_eval_cfg.folder_id if cloud_eval_cfg else None,
-            llm_yandex_model=cloud_eval_cfg.model if cloud_eval_cfg else "yandexgpt-lite",
-            llm_yandex_timeout=cloud_eval_cfg.timeout_seconds if cloud_eval_cfg else 60.0,
+            llm_backend=sidebar_state.cloud_backend,
+            llm_yandex_api_key=_yandex_cfg.api_key if _yandex_cfg.configured else None,
+            llm_yandex_folder_id=_yandex_cfg.folder_id if _yandex_cfg.configured else None,
+            llm_yandex_model=_yandex_cfg.model,
+            llm_yandex_timeout=_yandex_cfg.timeout_seconds,
+            asr_backend=sidebar_state.asr_backend,
         )
         cached_transcriber = get_cached_transcriber_for_gui(transcriber_settings)
 
@@ -1411,6 +1515,20 @@ def render_batch_tab(
                 except Exception as exc:
                     errors[file_name] = str(exc)
 
+                # Per-file timing tracking
+                _file_wall = time.perf_counter() - batch_ui["file_start"]
+                timing_record = {
+                    "name": file_name,
+                    "duration_seconds": round(_file_wall, 1),
+                    "status": "success" if file_name not in errors else "error",
+                }
+                if file_name not in errors and "row" in dir():
+                    try:
+                        timing_record["score"] = row.get("total_score", 0)
+                    except Exception:
+                        pass
+                batch_timings.append(timing_record)
+
                 # Чекпоинт после каждого файла: при сбросе продолжаем с места.
                 save_batch_resume_state(
                     BatchResumeState(
@@ -1422,6 +1540,8 @@ def render_batch_tab(
                         collected=collected,
                         errors=errors,
                         sheets_log=sheets_log,
+                        timings=batch_timings,
+                        batch_start_time=batch_ui["batch_start"],
                     )
                 )
 
@@ -1470,7 +1590,9 @@ def render_batch_tab(
     if errors:
         with st.expander(f"⚠️ Ошибки обработки ({len(errors)})", expanded=True):
             for fname, emsg in errors.items():
-                st.error(f"**{fname}**: {emsg}")
+                st.error(
+                    f"**{fname}**\n\n`{emsg}`"
+                )
 
     if not collected:
         return

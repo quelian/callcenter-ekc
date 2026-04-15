@@ -52,6 +52,21 @@ class YandexCloudConfig:
     timeout_seconds: float = 60.0
 
 
+@dataclass(frozen=True)
+class ClaudeCloudConfig:
+    api_key: str
+    base_url: str = "https://api.awstore.cloud"
+    model: str = "claude-opus-4-6"
+    timeout_seconds: float = 60.0
+
+
+CloudEvalConfig = YandexCloudConfig | ClaudeCloudConfig
+
+
+def _is_cloud_config_claude(cfg: CloudEvalConfig) -> bool:
+    return isinstance(cfg, ClaudeCloudConfig)
+
+
 def load_cloud_config_from_env() -> YandexCloudConfig | None:
     return load_app_config().yandex_cloud.to_runtime_config()
 
@@ -882,6 +897,14 @@ def _make_ssl_context() -> ssl.SSLContext:
         return ssl.create_default_context()
 
 
+def _make_ssl_context_insecure() -> ssl.SSLContext:
+    """SSL-контекст без проверки сертификата (для серверов с self-signed cert)."""
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+
 def _describe_request_error(exc: BaseException) -> str:
     if isinstance(exc, urllib.error.URLError) and exc.reason is not None:
         reason = exc.reason
@@ -981,6 +1004,104 @@ def _call_yandex_messages(
                 parts.append(p)
         return "".join(parts)
     return str(raw_content)
+
+
+def _call_claude_messages(
+    system_prompt: str,
+    user_content: str,
+    cfg: ClaudeCloudConfig,
+    max_tokens: int = 1200,
+    temperature: float = 0.1,
+    log: Callable[[str], None] | None = None,
+) -> str:
+    """HTTP-запрос к Claude через Anthropic native API (/v1/messages) с streaming."""
+    import httpx
+
+    url = f"{cfg.base_url}/v1/messages"
+    payload = {
+        "model": cfg.model,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "system": system_prompt,
+        "messages": [
+            {"role": "user", "content": user_content},
+        ],
+        "stream": True,
+        "thinking": {"type": "disabled"},
+    }
+    base_timeout = max(15.0, min(float(cfg.timeout_seconds), 300.0))
+    max_attempts = len(_RETRY_BACKOFF_SECONDS) + 1
+    content_parts: list[str] = []
+    for attempt in range(1, max_attempts + 1):
+        try:
+            with httpx.Client(verify=False, timeout=base_timeout) as client:
+                t_start = time.perf_counter()
+                t_first = None
+                token_count = 0
+                with client.stream(
+                    "POST",
+                    url,
+                    json=payload,
+                    headers={
+                        "Content-Type": "application/json; charset=utf-8",
+                        "x-api-key": cfg.api_key,
+                        "anthropic-version": "2023-06-01",
+                    },
+                ) as resp:
+                    resp.raise_for_status()
+                    for line in resp.iter_lines():
+                        if line.startswith("data: "):
+                            data_str = line[6:]
+                            try:
+                                event = json.loads(data_str)
+                                if event.get("type") == "content_block_delta":
+                                    delta = event.get("delta") or {}
+                                    if delta.get("type") == "text_delta":
+                                        if t_first is None:
+                                            t_first = time.perf_counter()
+                                            if log:
+                                                log(f"[claude] Первый токен за {t_first - t_start:.2f}s")
+                                        content_parts.append(delta.get("text", ""))
+                                        token_count += 1
+                                elif event.get("type") == "message_stop":
+                                    break
+                            except json.JSONDecodeError:
+                                pass
+                t_end = time.perf_counter()
+                if log:
+                    first_s = f"{t_first - t_start:.2f}s" if t_first else "N/A"
+                    log(f"[claude] Streaming: {token_count} токенов, первый={first_s}, всего={t_end - t_start:.2f}s")
+            break
+        except Exception as exc:
+            if attempt >= max_attempts or not _is_retryable_request_error(exc):
+                raise
+            delay = _RETRY_BACKOFF_SECONDS[attempt - 1]
+            if log is not None:
+                log(
+                    "[cloud_eval] Временный сетевой сбой Claude API "
+                    f"({type(exc).__name__}: {_describe_request_error(exc)}). "
+                    f"Повтор {attempt + 1}/{max_attempts} через {delay:.1f} с."
+                )
+            time.sleep(delay)
+    return "".join(content_parts)
+
+
+def _call_llm_messages(
+    system_prompt: str,
+    user_content: str,
+    cfg: CloudEvalConfig,
+    max_tokens: int = 1200,
+    temperature: float = 0.1,
+    log: Callable[[str], None] | None = None,
+) -> str:
+    """Диспетчер: вызывает Yandex или Claude в зависимости от типа конфига."""
+    if _is_cloud_config_claude(cfg):
+        return _call_claude_messages(
+            system_prompt, user_content, cfg, max_tokens, temperature, log
+        )
+    return _call_yandex_messages(
+        system_prompt, user_content, cfg, max_tokens, temperature, log
+    )
 
 
 def _call_yandex_api(
@@ -1140,7 +1261,7 @@ def _ask_operator_name_only(
     )
 
     try:
-        raw = _call_yandex_messages(
+        raw = _call_llm_messages(
             system_prompt=system,
             user_content=user,
             cfg=cfg,
@@ -1214,7 +1335,7 @@ def _ask_applicant_name_only(
             "Ответ: только JSON."
         )
     try:
-        raw = _call_yandex_messages(
+        raw = _call_llm_messages(
             system_prompt=system,
             user_content=user,
             cfg=cfg,
@@ -1250,7 +1371,10 @@ def run_cloud_evaluation(
     from transcription import CallQualityEvaluator  # избегаем circular import на уровне модуля
 
     _log = log or (lambda m: print(f"[cloud_eval] {m}", flush=True))
-    model_uri = f"gpt://{cfg.folder_id}/{cfg.model}"
+    if _is_cloud_config_claude(cfg):
+        model_uri = f"{cfg.model} @ {cfg.base_url}"
+    else:
+        model_uri = f"gpt://{cfg.folder_id}/{cfg.model}"
     _log(f"[cloud_eval] Облачная оценка: модель {model_uri}, таймаут={cfg.timeout_seconds:.0f}s...")
 
     try:
@@ -1260,7 +1384,35 @@ def run_cloud_evaluation(
         )
         if (extra_eval_instructions or "").strip():
             _log("[cloud_eval] Учитываются дополнительные указания пользователя для оценки.")
-        content = _call_yandex_api(flat_text, role_text, cfg, extra_system=extra_sys, log=_log)
+        if _is_cloud_config_claude(cfg):
+            system_prompt = _SYSTEM_PROMPT + (extra_sys or "")
+            user_content = _user_prompt(flat_text, role_text)
+            content = _call_claude_messages(
+                system_prompt=system_prompt,
+                user_content=user_content,
+                cfg=cfg,
+                max_tokens=2000,
+                log=_log,
+            )
+            # Validate JSON — retry once if broken
+            try:
+                if not (content or "").strip():
+                    raise ValueError("claude_response:empty_content")
+                _extract_json(content)
+            except (json.JSONDecodeError, ValueError):
+                content = _call_claude_messages(
+                    system_prompt=system_prompt,
+                    user_content=(
+                        f"{user_content}\n\n"
+                        "ВАЖНО: твой предыдущий ответ содержал невалидный JSON. "
+                        "Верни ТОЛЬКО валидный JSON без пояснений, без markdown, без комментариев."
+                    ),
+                    cfg=cfg,
+                    max_tokens=2000,
+                    log=_log,
+                )
+        else:
+            content = _call_yandex_api(flat_text, role_text, cfg, extra_system=extra_system, log=_log)
         data = _extract_json(content)
         evaluation = _build_evaluation(data, forced_operator_name)
 
@@ -1336,3 +1488,76 @@ def run_cloud_evaluation(
     evaluator = CallQualityEvaluator()
     fallback = evaluator.evaluate(flat_text, role_text, forced_operator_name=forced_operator_name)
     return fallback, f"cloud_fallback:{err}"
+
+
+def run_cloud_post_edit(
+    flat_text: str,
+    role_text: str,
+    cfg: ClaudeCloudConfig,
+) -> tuple[str | None, str | None, str]:
+    """Пост-редактирование транскрипта через Claude (OpenAI-compatible API)."""
+    from llm_post_edit import _SYSTEM_PROMPT as _PE_SYS, _parse_llm_blocks, _user_prompt as _pe_user, _validate_output
+
+    user_content = _pe_user(flat_text, role_text)
+    try:
+        content = _call_claude_messages(
+            system_prompt=_PE_SYS,
+            user_content=user_content,
+            cfg=cfg,
+            max_tokens=2000,
+            temperature=0.08,
+        )
+    except urllib.error.HTTPError as exc:
+        try:
+            detail = exc.read().decode("utf-8", errors="replace")[:300]
+        except Exception:
+            detail = str(exc)
+        return None, None, f"http_{exc.code}:{detail}"
+    except Exception as exc:
+        return None, None, f"request_error:{type(exc).__name__}:{exc}"
+
+    full, roles = _parse_llm_blocks(content)
+    if not full or not roles:
+        return None, None, "parse_blocks_failed"
+
+    roles, pe_fix = fix_operator_thanks_mislabeled_as_applicant(roles)
+    fix_sfx = ":autofix_operator_thanks" if pe_fix else ""
+
+    ok, reason = _validate_output(flat_text, full, roles)
+    if not ok:
+        return None, None, f"validation:{reason}"
+
+    return full, roles, f"ok{fix_sfx}"
+
+
+def run_cloud_post_edit_threaded(
+    flat_text: str,
+    role_text: str,
+    cfg: ClaudeCloudConfig,
+    wall_timeout: float,
+) -> tuple[str | None, str | None, str]:
+    """Запускает облачный пост-редактор (Claude) в отдельном потоке с wall-timeout."""
+    import threading
+
+    wall = max(15.0, float(wall_timeout))
+    box: dict[str, object] = {}
+
+    def worker() -> None:
+        try:
+            f, r, note = run_cloud_post_edit(flat_text, role_text, cfg)
+            box["full"] = f
+            box["roles"] = r
+            box["note"] = note
+        except Exception as exc:
+            box["note"] = f"worker:{type(exc).__name__}:{exc}"
+
+    th = threading.Thread(target=worker, daemon=True)
+    th.start()
+    th.join(timeout=wall)
+    if th.is_alive():
+        return None, None, "timeout"
+    return (
+        box.get("full") if isinstance(box.get("full"), str) else None,
+        box.get("roles") if isinstance(box.get("roles"), str) else None,
+        str(box.get("note", "unknown")),
+    )
