@@ -1607,6 +1607,28 @@ def render_batch_tab(
         unsafe_allow_html=True,
     )
 
+    # Summary stats row
+    try:
+        import pandas as pd  # noqa: F811
+
+        _scores = [r["total_score"] for r in collected]
+        _avg = sum(_scores) / len(_scores)
+        _reviews = sum(1 for r in collected if r["review_flag"] == "Да")
+        _high = sum(1 for s in _scores if s >= 8)
+        _low = sum(1 for s in _scores if s < 5)
+
+        _summary_cols = st.columns(4)
+        with _summary_cols[0]:
+            st.metric("Средний балл", f"{_avg:.1f}/10")
+        with _summary_cols[1]:
+            st.metric("Отлично (≥8)", f"{_high}/{len(collected)}")
+        with _summary_cols[2]:
+            st.metric("Требует проверки", f"{_reviews}")
+        with _summary_cols[3]:
+            st.metric("Низкие (<5)", f"{_low}")
+    except ImportError:
+        pass
+
     # Итоговая таблица
     try:
         import pandas as pd
