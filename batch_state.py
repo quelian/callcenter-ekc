@@ -7,7 +7,7 @@ from typing import Any
 
 from state_paths import ensure_app_state_dir
 
-STATE_VERSION = 1
+STATE_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -15,6 +15,16 @@ class BatchFileJob:
     name: str
     path: str
     size: int = 0
+
+
+@dataclass(frozen=True)
+class BatchFileTiming:
+    """Per-file timing and diagnostics."""
+    name: str
+    duration_seconds: float = 0.0
+    asr_backend: str = "unknown"
+    score: int = 0
+    status: str = "pending"  # pending, success, error, skipped
 
 
 @dataclass
@@ -28,6 +38,8 @@ class BatchResumeState:
     collected: list[dict[str, Any]] = field(default_factory=list)
     errors: dict[str, str] = field(default_factory=dict)
     sheets_log: dict[str, str] = field(default_factory=dict)
+    timings: list[dict[str, Any]] = field(default_factory=list)
+    batch_start_time: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -43,6 +55,8 @@ class BatchResumeState:
             "collected": self.collected,
             "errors": self.errors,
             "sheets_log": self.sheets_log,
+            "timings": self.timings,
+            "batch_start_time": self.batch_start_time,
         }
 
 
@@ -66,7 +80,9 @@ def load_batch_resume_state() -> BatchResumeState | None:
         return None
     if not isinstance(obj, dict):
         return None
-    if int(obj.get("version", STATE_VERSION) or STATE_VERSION) != STATE_VERSION:
+    stored_version = int(obj.get("version", 1) or 1)
+    # Support backward-compatible loading: v1 files lack timings/batch_start_time
+    if stored_version > STATE_VERSION:
         return None
     raw_files = obj.get("files", [])
     files: list[BatchFileJob] = []
@@ -84,6 +100,8 @@ def load_batch_resume_state() -> BatchResumeState | None:
     collected = obj.get("collected", [])
     errors = obj.get("errors", {})
     sheets_log = obj.get("sheets_log", {})
+    timings = obj.get("timings", [])
+    batch_start_time = float(obj.get("batch_start_time", 0.0) or 0.0)
     return BatchResumeState(
         version=STATE_VERSION,
         created_at=float(obj.get("created_at") or 0.0),
@@ -94,6 +112,8 @@ def load_batch_resume_state() -> BatchResumeState | None:
         collected=list(collected) if isinstance(collected, list) else [],
         errors=dict(errors) if isinstance(errors, dict) else {},
         sheets_log=dict(sheets_log) if isinstance(sheets_log, dict) else {},
+        timings=list(timings) if isinstance(timings, list) else [],
+        batch_start_time=batch_start_time,
     )
 
 

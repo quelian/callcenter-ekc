@@ -1200,6 +1200,7 @@ def render_batch_tab(
         collected: list[dict] = []
         errors: dict[str, str] = {}
         sheets_log: dict[str, str] = {}
+        batch_timings: list[dict] = []
 
         if resume_batch and resume_state is not None:
             raw_jobs = resume_state.files
@@ -1212,6 +1213,7 @@ def render_batch_tab(
             collected = list(resume_state.collected)
             errors = dict(resume_state.errors)
             sheets_log = dict(resume_state.sheets_log)
+            batch_timings = list(resume_state.timings) if hasattr(resume_state, "timings") else []
             if start_idx >= len(file_jobs):
                 st.info("Незавершённых файлов не осталось.")
                 clear_batch_resume_state()

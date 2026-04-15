@@ -10,7 +10,7 @@ from env_store import merge_env_file, normalize_google_spreadsheet_id
 from transcription import resolve_ultima_whisper_model
 
 if TYPE_CHECKING:
-    from llm_cloud_eval import YandexCloudConfig
+    from llm_cloud_eval import CloudEvalConfig
 
 _YANDEX_MODEL_ORDER = (
     "yandexgpt-lite",
@@ -27,23 +27,24 @@ _YANDEX_MODEL_LABELS = {
 
 @dataclass(frozen=True)
 class SidebarState:
-    use_yandex: bool
-    cloud_eval_cfg: YandexCloudConfig | None
+    cloud_backend: str  # "yandex" | "claude" | "off"
+    cloud_eval_cfg: "CloudEvalConfig | None"
     model_name: str
     compute_type: str
     asr_profile: str
     heavy_mode: bool
     heavy_timeout: int
     enable_post_edit: bool
+    asr_backend: str = "whisper"  # "whisper" | "assemblyai" | "nexara"
 
 
 def render_admin_panel_sidebar() -> None:
     """Ключ Yandex, Folder ID и таблица Google — только после ввода пароля; сохранение в .env."""
     app_config = load_app_config()
     st.divider()
-    with st.expander("🔐 Админ-панель", expanded=False):
+    with st.expander("⚙️ Админ-панель", expanded=False):
         st.caption(
-            "Ключ API Яндекса и ссылка/ID Google Таблицы можно менять **только здесь** "
+            "Ключи API и ссылка/ID Google Таблицы настраиваются здесь "
             "(после входа по паролю). Изменения записываются в файл `.env`."
         )
 
@@ -57,8 +58,8 @@ def render_admin_panel_sidebar() -> None:
 
         if not st.session_state.get("admin_panel_unlocked"):
             with st.form("admin_login_form", clear_on_submit=False):
-                pwd_in = st.text_input("Пароль администратора", type="password", key="admin_pw_field")
-                login = st.form_submit_button("Войти")
+                pwd_in = st.text_input("Пароль администратора", type="password", key="admin_pw_field", placeholder="Введите пароль")
+                login = st.form_submit_button("Войти", type="primary")
             if login:
                 if (pwd_in or "").strip() == (app_config.security.admin_panel_password or ""):
                     st.session_state["admin_panel_unlocked"] = True
@@ -86,6 +87,71 @@ def render_admin_panel_sidebar() -> None:
                 help="YANDEX_FOLDER_ID в консоли Yandex Cloud.",
                 key="admin_yandex_folder",
             )
+            st.markdown("**Claude (awstore)**")
+            claude_configured = app_config.claude_cloud.configured
+            if claude_configured:
+                st.markdown(
+                    '<div class="ai-connected">🟢 Claude подключён</div>',
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.markdown(
+                    '<div class="ai-disconnected">⚪ Claude: ключ не задан</div>',
+                    unsafe_allow_html=True,
+                )
+            new_claude_api = st.text_input(
+                "Claude API Key",
+                value="",
+                type="password",
+                placeholder="Оставьте пустым, чтобы не менять текущий ключ",
+                help="Ключ API для Claude (api.awstore.cloud).",
+                key="admin_claude_api",
+            )
+            new_claude_base = st.text_input(
+                "Claude Base URL",
+                value=app_config.claude_cloud.base_url,
+                help="Базовый URL OpenAI-совместимого API Claude.",
+                key="admin_claude_base",
+            )
+            st.markdown("**AssemblyAI**")
+            assemblyai_configured = app_config.assemblyai.configured
+            if assemblyai_configured:
+                st.markdown(
+                    '<div class="ai-connected">🟢 AssemblyAI подключён</div>',
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.markdown(
+                    '<div class="ai-disconnected">⚪ AssemblyAI: ключ не задан</div>',
+                    unsafe_allow_html=True,
+                )
+            new_assemblyai_api = st.text_input(
+                "AssemblyAI API Key",
+                value="",
+                type="password",
+                placeholder="Оставьте пустым, чтобы не менять текущий ключ",
+                help="Ключ API AssemblyAI (https://www.assemblyai.com/app/account).",
+                key="admin_assemblyai_api",
+            )
+            nexara_configured = app_config.nexara.configured
+            if nexara_configured:
+                st.markdown(
+                    '<div class="ai-connected">🟢 Nexara подключён</div>',
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.markdown(
+                    '<div class="ai-disconnected">⚪ Nexara: ключ не задан</div>',
+                    unsafe_allow_html=True,
+                )
+            new_nexara_api = st.text_input(
+                "Nexara API Key",
+                value="",
+                type="password",
+                placeholder="Оставьте пустым, чтобы не менять текущий ключ",
+                help="Ключ API Nexara (https://docs.nexara.ru/guides).",
+                key="admin_nexara_api",
+            )
             st.markdown("**Google Таблица**")
             new_sheet = st.text_input(
                 "Ссылка или ID таблицы",
@@ -97,7 +163,7 @@ def render_admin_panel_sidebar() -> None:
                 ),
                 key="admin_sheet_url",
             )
-            save = st.form_submit_button("Сохранить в .env")
+            save = st.form_submit_button("Сохранить", type="primary")
         if save:
             updates: dict[str, str] = {}
             api_stripped = (new_api or "").strip()
@@ -106,6 +172,18 @@ def render_admin_panel_sidebar() -> None:
             folder_stripped = (new_folder or "").strip()
             if folder_stripped:
                 updates["YANDEX_FOLDER_ID"] = folder_stripped
+            claude_api_stripped = (new_claude_api or "").strip()
+            if claude_api_stripped:
+                updates["CLAUDE_API_KEY"] = claude_api_stripped
+            claude_base_stripped = (new_claude_base or "").strip()
+            if claude_base_stripped:
+                updates["CLAUDE_BASE_URL"] = claude_base_stripped
+            assemblyai_stripped = (new_assemblyai_api or "").strip()
+            if assemblyai_stripped:
+                updates["ASSEMBLYAI_API_KEY"] = assemblyai_stripped
+            nexara_stripped = (new_nexara_api or "").strip()
+            if nexara_stripped:
+                updates["NEXARA_API_KEY"] = nexara_stripped
             sid = normalize_google_spreadsheet_id(new_sheet)
             if sid:
                 updates["GOOGLE_SHEETS_SPREADSHEET_ID"] = sid
@@ -128,6 +206,12 @@ def render_admin_panel_sidebar() -> None:
                         except Exception:
                             pass
                     if updated_keys & {"YANDEX_API_KEY", "YANDEX_FOLDER_ID"}:
+                        st.cache_resource.clear()
+                    if updated_keys & {"CLAUDE_API_KEY", "CLAUDE_BASE_URL"}:
+                        st.cache_resource.clear()
+                    if "ASSEMBLYAI_API_KEY" in updated_keys:
+                        st.cache_resource.clear()
+                    if "NEXARA_API_KEY" in updated_keys:
                         st.cache_resource.clear()
                     st.success("Сохранено. Переменные обновлены для текущего сеанса.")
                     st.rerun()
@@ -166,32 +250,47 @@ def render_sidebar(app_version_label: str, app_version_date: str) -> SidebarStat
             unsafe_allow_html=True,
         )
 
-        env_api_key = app_config.yandex_cloud.api_key or ""
-        env_folder_id = app_config.yandex_cloud.folder_id or ""
-        env_keys_set = bool(env_api_key and env_folder_id)
+        # Determine which backends are configured
+        yandex_configured = app_config.yandex_cloud.configured
+        claude_configured = app_config.claude_cloud.configured
 
-        st.markdown("**Яндекс AI Studio**")
-        use_yandex = st.toggle(
-            "Включить AI-анализ",
-            value=env_keys_set,
-            help="Включает облачную оценку и исправление транскрипта через Яндекс AI.",
+        # Default backend: prefer Claude if configured, then Yandex, then off
+        _default_backend = "off"
+        if yandex_configured or claude_configured:
+            if claude_configured:
+                _default_backend = "claude"
+            elif yandex_configured:
+                _default_backend = "yandex"
+
+        st.markdown("**🤖 AI-анализ**")
+        cloud_backend = st.radio(
+            "Бэкенд",
+            options=["yandex", "claude", "off"],
+            format_func=lambda v: {
+                "yandex": "Yandex AI Studio",
+                "claude": "Claude (awstore)",
+                "off": "Отключить",
+            }[v],
+            horizontal=True,
+            index=["yandex", "claude", "off"].index(_default_backend),
+            help="Yandex AI Studio или Claude через api.awstore.cloud для оценки качества звонков.",
         )
 
-        cloud_eval_cfg: YandexCloudConfig | None = None
-        yandex_api_key = env_api_key
-        yandex_folder_id = env_folder_id
-        # При выключенном AI значение не используется для запросов.
-        yandex_timeout = int(app_config.yandex_cloud.timeout_seconds)
+        cloud_eval_cfg: "CloudEvalConfig | None" = None
 
-        if use_yandex:
-            if env_keys_set:
+        if cloud_backend == "yandex":
+            env_api_key = app_config.yandex_cloud.api_key or ""
+            env_folder_id = app_config.yandex_cloud.folder_id or ""
+            yandex_timeout = int(app_config.yandex_cloud.timeout_seconds)
+
+            if yandex_configured:
                 st.markdown(
-                    '<div class="ai-connected">🟢 Подключено — ключи заданы (см. Админ-панель для смены)</div>',
+                    '<div class="ai-connected">🟢 Yandex AI Studio подключён</div>',
                     unsafe_allow_html=True,
                 )
             else:
                 st.markdown(
-                    '<div class="ai-disconnected">🟡 Ключи не заданы — укажите API Key и Folder ID в «Админ-панели» ниже</div>',
+                    '<div class="ai-disconnected">⚠️ Ключи не заданы — откройте Админ-панель ниже</div>',
                     unsafe_allow_html=True,
                 )
 
@@ -213,7 +312,7 @@ def render_sidebar(app_version_label: str, app_version_date: str) -> SidebarStat
                 ),
             )
 
-            with st.expander("Дополнительно", expanded=False):
+            with st.expander("⚡ Дополнительно", expanded=False):
                 yandex_timeout = st.slider(
                     "Таймаут запроса (сек)",
                     min_value=15,
@@ -223,17 +322,57 @@ def render_sidebar(app_version_label: str, app_version_date: str) -> SidebarStat
                     help="Для длинных звонков при необходимости увеличьте (до 120 с и выше).",
                 )
 
-            if yandex_api_key.strip() and yandex_folder_id.strip():
+            if env_api_key.strip() and env_folder_id.strip():
                 from llm_cloud_eval import YandexCloudConfig
 
                 cloud_eval_cfg = YandexCloudConfig(
-                    api_key=yandex_api_key.strip(),
-                    folder_id=yandex_folder_id.strip(),
+                    api_key=env_api_key.strip(),
+                    folder_id=env_folder_id.strip(),
                     model=yandex_model_key,
                     timeout_seconds=float(yandex_timeout),
                 )
             else:
-                st.warning("Укажите API Key и Folder ID в разделе «Админ-панель» ниже.")
+                st.warning("Задайте API Key и Folder ID в Админ-панели ниже.")
+
+        elif cloud_backend == "claude":
+            claude_api_key = app_config.claude_cloud.api_key or ""
+            claude_base_url = app_config.claude_cloud.base_url
+            claude_model = app_config.claude_cloud.model
+            claude_timeout = int(app_config.claude_cloud.timeout_seconds)
+
+            if claude_configured:
+                st.markdown(
+                    '<div class="ai-connected">🟢 Claude подключён</div>',
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.markdown(
+                    '<div class="ai-disconnected">🟡 Ключ не задан — укажите CLAUDE_API_KEY в «Админ-панели» ниже</div>',
+                    unsafe_allow_html=True,
+                )
+
+            with st.expander("⚡ Дополнительно", expanded=False):
+                claude_timeout = st.slider(
+                    "Таймаут запроса (сек)",
+                    min_value=15,
+                    max_value=300,
+                    value=claude_timeout,
+                    step=5,
+                    help="Для длинных звонков при необходимости увеличьте.",
+                )
+
+            if claude_api_key.strip():
+                from llm_cloud_eval import ClaudeCloudConfig
+
+                cloud_eval_cfg = ClaudeCloudConfig(
+                    api_key=claude_api_key.strip(),
+                    base_url=claude_base_url,
+                    model=claude_model,
+                    timeout_seconds=float(claude_timeout),
+                )
+            else:
+                st.warning("Задайте API Key в Админ-панели ниже.")
+
         else:
             st.markdown(
                 '<div class="ai-disconnected">⚪ AI отключён — только локальная эвристика</div>',
@@ -241,7 +380,50 @@ def render_sidebar(app_version_label: str, app_version_date: str) -> SidebarStat
             )
 
         st.divider()
-        st.markdown("**Распознавание речи**")
+        st.markdown("**🎙️ Распознавание речи**")
+
+        # ASR backend selector
+        asr_backend = st.radio(
+            "Бэкенд ASR",
+            options=["whisper", "assemblyai", "nexara"],
+            format_func=lambda v: {
+                "whisper": "Whisper (локальный)",
+                "assemblyai": "AssemblyAI (облачный)",
+                "nexara": "Nexara (облачный)",
+            }[v],
+            horizontal=True,
+            help=(
+                "Whisper: локальная модель, полная настройка VAD и hotwords. "
+                "AssemblyAI: облачное распознавание с автоматической диаризацией; "
+                "не требует загрузки моделей, но нужен API-ключ. "
+                "Nexara: облачное распознавание с диаризацией; экспериментальная модель."
+            ),
+        )
+
+        if asr_backend == "assemblyai":
+            if app_config.assemblyai.configured:
+                st.markdown(
+                    '<div class="ai-connected">🟢 AssemblyAI подключён</div>',
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.markdown(
+                    '<div class="ai-disconnected">⚪ AssemblyAI: ключ не задан (укажите ASSEMBLYAI_API_KEY в Админ-панели)</div>',
+                    unsafe_allow_html=True,
+                )
+
+        if asr_backend == "nexara":
+            if app_config.nexara.configured:
+                st.markdown(
+                    '<div class="ai-connected">🟢 Nexara подключён</div>',
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.markdown(
+                    '<div class="ai-disconnected">⚪ Nexara: ключ не задан (укажите NEXARA_API_KEY в Админ-панели)</div>',
+                    unsafe_allow_html=True,
+                )
+
         quality = st.radio(
             "Качество",
             options=["ultima", "max", "standard"],
@@ -251,6 +433,7 @@ def render_sidebar(app_version_label: str, app_version_date: str) -> SidebarStat
                 "ultima": "🔮 Ultima (~7–12 мин, RU Large-v3)",
             }[value],
             horizontal=True,
+            disabled=(asr_backend in ("assemblyai", "nexara")),
             help=(
                 "Стандарт: Whisper Medium, int8; быстро, достаточно для большинства звонков. "
                 "Максимум: Systran Large-v3 + beam 9/best_of 5 + 3 температуры; максимальное качество. "
@@ -264,13 +447,14 @@ def render_sidebar(app_version_label: str, app_version_date: str) -> SidebarStat
         )
         model_name, compute_type, asr_profile, heavy_mode = _resolve_transcription_profile(quality)
 
-        with st.expander("Тонкая настройка", expanded=False):
+        with st.expander("⚡ Тонкая настройка", expanded=False):
             heavy_timeout = st.slider(
                 "Таймаут диаризации (сек)",
                 min_value=90,
                 max_value=300,
                 value=150,
                 step=10,
+                disabled=(asr_backend in ("assemblyai", "nexara")),
             )
             enable_post_edit = st.checkbox(
                 "Локальный пунктуатор",
@@ -281,7 +465,7 @@ def render_sidebar(app_version_label: str, app_version_date: str) -> SidebarStat
         render_admin_panel_sidebar()
 
     return SidebarState(
-        use_yandex=use_yandex,
+        cloud_backend=cloud_backend,
         cloud_eval_cfg=cloud_eval_cfg,
         model_name=model_name,
         compute_type=compute_type,
@@ -289,4 +473,5 @@ def render_sidebar(app_version_label: str, app_version_date: str) -> SidebarStat
         heavy_mode=heavy_mode,
         heavy_timeout=heavy_timeout,
         enable_post_edit=enable_post_edit,
+        asr_backend=asr_backend,
     )

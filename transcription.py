@@ -41,7 +41,7 @@ except Exception:
 
 from app_config import load_app_environment
 from hf_hub_sync import HF_HUB_DOWNLOAD_LOCK, force_huggingface_hub_online
-from operator_staff import OPERATOR_ALIASES, canonicalize_operator_name
+from operator_staff import OPERATOR_ALIASES, OPERATOR_CANONICAL_NAMES, canonicalize_operator_name
 from audio_io_safe import is_probably_compressed_audio, load_audio_mono_16k_safe
 from applicant_name_utils import APPLICANT_NAME_NOISE_WORDS, normalize_applicant_name_candidate
 from role_misattribution_fix import fix_operator_thanks_mislabeled_as_applicant
@@ -62,6 +62,9 @@ class TranscriptionResult:
     role_diagnostics: str = ""
     asr_profile: str = "medium_ru"
     asr_model: str = "unknown"
+    asr_backend: str = "whisper"
+    assemblyai_entities: list[dict] | None = None
+    assemblyai_content_moderation: dict | None = None
 
 
 @dataclass
@@ -790,6 +793,7 @@ class Transcriber:
         llm_yandex_api_key: str | None = None,
         llm_yandex_folder_id: str | None = None,
         llm_yandex_model: str = "yandexgpt-lite",
+        asr_backend: str = "whisper",
     ) -> None:
         self.model_name = self._resolve_model_name(model_name)
         self.compute_type = compute_type
@@ -813,6 +817,11 @@ class Transcriber:
         self.llm_yandex_api_key = llm_yandex_api_key
         self.llm_yandex_folder_id = llm_yandex_folder_id
         self.llm_yandex_model = llm_yandex_model or "yandexgpt-lite"
+        self.asr_backend = (asr_backend or "whisper").strip().lower()
+        # LLM Claude backend — optional, used only when llm_backend == "claude"
+        self.llm_claude_api_key = None
+        self.llm_claude_base_url = None
+        self.llm_claude_model = None
         self._model = None
         self._asr_runtime_device = ""
         self._asr_runtime_compute = ""
@@ -1524,6 +1533,13 @@ class Transcriber:
         ).rstrip("/")
         if not base:
             return None
+        # Validate URL format — catches common typos early
+        if not base.startswith(("http://", "https://")):
+            self._log(
+                f"LLM base_url не начинается с http:// или https://: «{base}» — "
+                "добавьте протокол, иначе запросы могут не дойти."
+            )
+            return None
         model = (self.llm_post_edit_model or "").strip() or (
             os.environ.get("LLM_POST_EDIT_MODEL") or ""
         ).strip()
@@ -1728,6 +1744,34 @@ class Transcriber:
         scored.sort(reverse=True)
         return scored[0][1] if scored else None
 
+    def _pick_operator_cluster_from_speakers(
+        self,
+        speaker_texts: dict[str, list[str]],
+    ) -> str | None:
+        """Определяет спикера-оператора по текстовым признакам (AssemblyAI diarization)."""
+        if len(speaker_texts) < 2:
+            return None
+
+        speakers = list(speaker_texts.keys())
+        # Первый спикер обычно оператор (приветствие)
+        first_speaker = speakers[0]
+        first_texts = speaker_texts.get(first_speaker, [])
+        first_op_s, first_app_s = 0, 0
+        for t in first_texts[:4]:
+            o, a = self._role_scores(t)
+            first_op_s += o
+            first_app_s += a
+        if first_op_s >= first_app_s:
+            return first_speaker
+
+        # Сравниваем общий operator-score по всем спикерам
+        scores: list[tuple[float, str]] = []
+        for spk, texts in speaker_texts.items():
+            op_score = sum(self._role_scores(t)[0] for t in texts)
+            scores.append((op_score, spk))
+        scores.sort(reverse=True)
+        return scores[0][1] if scores else None
+
     def _role_confidence_label(
         self,
         cluster_scores: dict[str, float],
@@ -1917,6 +1961,10 @@ class Transcriber:
         return "\n".join(merged_lines)
 
     def _ensure_model(self) -> None:
+        if self.asr_backend in ("assemblyai", "nexara"):
+            backend_name = "Nexara" if self.asr_backend == "nexara" else "AssemblyAI"
+            self._stage("ASR-бэкенд", f"{backend_name} (облачный) — локальная модель не требуется")
+            return
         if self._model is not None:
             self._stage(
                 "ASR-модель",
@@ -2233,15 +2281,867 @@ class Transcriber:
             role_diagnostics = f"role_mode=fallback; exception={exc}; asr_seconds={asr_elapsed:.2f}"
         return role_text, role_attribution, role_confidence, role_diagnostics, base_pieces, base_roles
 
+    def _transcribe_assemblyai(
+        self,
+        audio_path: str,
+        *,
+        original_basename: str | None = None,
+    ) -> TranscriptionResult:
+        """Транскрибация через AssemblyAI API (Universal-2 + diarization + intelligence)."""
+        from app_config import load_app_config
+        from assemblyai_backend import (
+            AssemblyAIConfig,
+            build_custom_spelling_for_operators,
+            extract_applicant_name_from_entities,
+            extract_content_moderation,
+            extract_entities,
+            map_assemblyai_to_voice_items,
+            transcribe as assemblyai_transcribe,
+        )
+
+        cfg = load_app_config()
+        api_key = cfg.assemblyai.api_key
+        if not api_key:
+            raise RuntimeError(
+                "AssemblyAI backend выбран, но ASSEMBLYAI_API_KEY не задан. "
+                "Укажите ключ в .env или в Админ-панели."
+            )
+
+        timeout = cfg.assemblyai.timeout_seconds
+        path = str(audio_path)
+        self._log(f"AssemblyAI backend: файл «{Path(path).name}»")
+
+        # Parse wait skip from filename (same as Whisper path)
+        skip_sec = 0.0
+        name_for_skip = (original_basename or Path(path).name).strip()
+        name_for_skip = Path(name_for_skip).name
+        parsed = parse_call_filename_wait_skip(name_for_skip)
+        if parsed is not None:
+            tot_wait, wait_token = parsed
+            disable_fn = os.environ.get("CALLQA_DISABLE_FILENAME_SKIP", "").strip().lower() in (
+                "1", "true", "yes",
+            )
+            if disable_fn:
+                self._log("[asr] Пропуск начала по хвосту имени отключён (CALLQA_DISABLE_FILENAME_SKIP).")
+            else:
+                skip_sec = tot_wait
+                mm = int(skip_sec // 60)
+                ss = int(skip_sec % 60)
+                self._log(
+                    f"Пропуск ожидания по имени файла: «{wait_token}» → {skip_sec:.0f} с "
+                    f"({mm:02d}:{ss:02d} от начала записи)"
+                )
+
+        # Build AssemblyAI config — максимальная точность
+        custom_spelling = build_custom_spelling_for_operators(
+            list(OPERATOR_CANONICAL_NAMES)
+        )
+        # Ключевые слова для boost — только имена операторов
+        word_boost = list(OPERATOR_CANONICAL_NAMES)
+        aai_config = AssemblyAIConfig(
+            api_key=api_key,
+            language="ru",
+            model="universal-2",
+            speaker_labels=True,
+            entity_detection=True,
+            content_moderation=True,
+            timeout_seconds=timeout,
+            custom_spelling=custom_spelling,
+            word_boost=word_boost,
+            word_boost_param="high",   # МАКСИМАЛЬНЫЙ boost для ключевых слов
+            punctuate=True,            # автоматическая пунктуация
+            format_text=True,          # форматирование текста
+            filter_profanity=False,    # НЕ фильтровать мат — сохранять точность
+            speakers_expected=2,       # ожидаемое число спикеров
+            min_speakers=1,            # минимум 1 спикер
+            max_speakers=3,            # максимум 3 спикера (жёсткое ограничение)
+        )
+
+        self._stage("AssemblyAI", "загрузка аудио и отправка задачи транскрибации...")
+        aai_started = time.perf_counter()
+
+        response = assemblyai_transcribe(api_key, path, aai_config, log=self._log)
+
+        aai_elapsed = time.perf_counter() - aai_started
+        self._stage("AssemblyAI", f"транскрибация завершена за {aai_elapsed:.1f} с")
+
+        # Map utterances to voice items
+        voice_items = map_assemblyai_to_voice_items(response)
+        if not voice_items:
+            # Fallback: use flat text
+            flat_text = response.get("text", "").strip()
+            self._log("[assemblyai] utterances пусты — использую плоский текст без диаризации")
+            text = self._postprocess_ru_text(flat_text)
+            return TranscriptionResult(
+                text=text,
+                language="ru",
+                role_text="",
+                role_attribution="n/a",
+                role_confidence="n/a",
+                role_diagnostics="role_mode=assemblyai_no_utterances",
+                asr_profile="assemblyai",
+                asr_model="assemblyai/universal-2",
+                asr_backend="assemblyai",
+            )
+
+        # Apply skip offset to voice items if needed
+        if skip_sec > 0:
+            voice_items = [
+                (s - skip_sec, e - skip_sec, t, spk)
+                for s, e, t, spk in voice_items
+                if e > skip_sec
+            ]
+            voice_items = [
+                (max(0, s), e, t, spk) for s, e, t, spk in voice_items
+            ]
+
+        # Build flat text from voice items
+        text = " ".join(t for _, _, t, _ in voice_items).strip()
+        text = self._postprocess_ru_text(text)
+
+        self._stage("текст", f"символов ≈{len(text)}, фрагментов={len(voice_items)}")
+
+        # Extract intelligence features
+        entities = extract_entities(response)
+        content_moderation = extract_content_moderation(response)
+        applicant_name_hint = extract_applicant_name_from_entities(entities, log=self._log)
+
+        # Role assignment via AssemblyAI diarization (speaker A, B, ...)
+        total_started = time.perf_counter()
+        self._stage(
+            "роли",
+            f"AssemblyAI diarization: {len(voice_items)} фрагментов",
+        )
+        # voice_items: list[(start, end, text, speaker_id)] — используем готовые метки
+        speaker_ids = [spk for _, _, _, spk in voice_items]
+        unique_speakers = list(dict.fromkeys(speaker_ids))  # preserve order, dedup
+
+        # Определяем кто оператор, кто заявитель по текстовым подсказкам
+        speaker_texts: dict[str, list[str]] = {}
+        for _, _, txt, spk in voice_items:
+            speaker_texts.setdefault(spk, []).append(txt)
+
+        # Определяем операторский кластер по текстовым признакам
+        operator_speaker = self._pick_operator_cluster_from_speakers(speaker_texts)
+        if not operator_speaker and unique_speakers:
+            operator_speaker = unique_speakers[0]
+
+        role_map = {
+            spk: ("Оператор" if spk == operator_speaker else "Заявитель")
+            for spk in unique_speakers
+        }
+
+        # Строим role_text и role_labels
+        role_labels = [role_map.get(spk, "Неизвестно") for spk in speaker_ids]
+        role_pieces = [(s, e, t) for s, e, t, _ in voice_items]
+        role_text = self._build_role_transcript(
+            " ".join(t for _, _, t, _ in voice_items),
+            chunks=[t for _, _, t, _ in voice_items],
+        )
+        # Формируем role_text с ролями
+        role_text_parts = []
+        for _, _, txt, spk in voice_items:
+            role = role_map.get(spk, "Неизвестно")
+            role_text_parts.append(f"{role}: {txt}")
+        role_text = "\n".join(role_text_parts)
+
+        role_attribution = "AssemblyAI diarization"
+        role_confidence = "medium"
+        role_diagnostics = (
+            f"role_mode=assemblyai_diarization; speakers={unique_speakers}; "
+            f"operator_speaker={operator_speaker or 'unknown'}; "
+            f"asr_seconds={aai_elapsed:.2f}"
+        )
+        joint_elapsed = time.perf_counter() - total_started
+        self._stage(
+            "роли",
+            f"блок завершён за {joint_elapsed:.2f} с — {role_attribution}; уверенность={role_confidence}",
+        )
+
+        text_work = text
+        role_text_work = role_text
+
+        # LLM post-edit (reuse existing logic)
+        llm_elapsed = 0.0
+        llm_diag = "disabled"
+        nf: str | None = None
+        nr: str | None = None
+        llm_note = ""
+        llm_cfg = self._resolve_llm_post_edit_config()
+        if not self.enable_llm_post_edit:
+            self._stage("LLM-постредактор", "выключен в настройках")
+        if self.enable_llm_post_edit and self.llm_backend == "claude":
+            from app_config import load_app_config
+            from llm_cloud_eval import ClaudeCloudConfig, run_cloud_post_edit_threaded
+
+            app_cfg = load_app_config()
+            claude_cfg = app_cfg.claude_cloud.to_post_edit_config() if app_cfg.claude_cloud.api_key else None
+            if claude_cfg is None:
+                claude_cfg = ClaudeCloudConfig(
+                    api_key=self.llm_claude_api_key or "",
+                    base_url=self.llm_claude_base_url or "https://api.awstore.cloud",
+                    model=self.llm_claude_model or "claude-sonnet-4-6",
+                    timeout_seconds=self.llm_post_edit_timeout_seconds,
+                )
+            self._stage(
+                "LLM",
+                f"Claude (awstore), модель {claude_cfg.model}",
+            )
+            self._log(
+                f"LLM пост-редактор (Claude, {claude_cfg.base_url}, модель={claude_cfg.model}), "
+                f"таймаут≤{claude_cfg.timeout_seconds:.0f}s..."
+            )
+            t_llm = time.perf_counter()
+            nf, nr, llm_note = run_cloud_post_edit_threaded(
+                text_work,
+                role_text_work,
+                cfg=claude_cfg,
+                wall_timeout=claude_cfg.timeout_seconds,
+            )
+            llm_elapsed = time.perf_counter() - t_llm
+            if nf and nr:
+                text_work = self._postprocess_ru_text(nf)
+                role_text_work = nr.strip()
+                llm_diag = f"ok:{llm_note}"
+                self._log(f"LLM пост-редактор готов за {llm_elapsed:.2f}s ({llm_diag})")
+            else:
+                llm_diag = f"fallback:{llm_note}"
+                self._log(f"LLM пост-редактор не применён ({llm_diag}), {llm_elapsed:.2f}s")
+        elif self.enable_llm_post_edit and self.llm_backend == "yandex" and self.llm_yandex_api_key and self.llm_yandex_folder_id:
+            from llm_cloud_eval import YandexCloudConfig, run_yandex_post_edit_threaded
+
+            self._stage(
+                "LLM",
+                f"Yandex AI Studio, модель gpt://{self.llm_yandex_folder_id}/{self.llm_yandex_model}",
+            )
+            ycfg = YandexCloudConfig(
+                api_key=self.llm_yandex_api_key,
+                folder_id=self.llm_yandex_folder_id,
+                model=self.llm_yandex_model,
+                timeout_seconds=self.llm_post_edit_timeout_seconds,
+            )
+            self._log(
+                f"LLM пост-редактор (Yandex AI Studio, gpt://{self.llm_yandex_folder_id}/{self.llm_yandex_model}), "
+                f"таймаут≤{self.llm_post_edit_timeout_seconds:.0f}s..."
+            )
+            t_llm = time.perf_counter()
+            nf, nr, llm_note = run_yandex_post_edit_threaded(
+                text_work,
+                role_text_work,
+                cfg=ycfg,
+                wall_timeout=float(self.llm_post_edit_timeout_seconds),
+            )
+            llm_elapsed = time.perf_counter() - t_llm
+            if nf and nr:
+                text_work = self._postprocess_ru_text(nf)
+                role_text_work = nr.strip()
+                llm_diag = f"ok:{llm_note}"
+                self._log(f"LLM пост-редактор готов за {llm_elapsed:.2f}s ({llm_diag})")
+            else:
+                llm_diag = f"fallback:{llm_note}"
+                self._log(f"LLM пост-редактор не применён ({llm_diag}), {llm_elapsed:.2f}s")
+        elif self.enable_llm_post_edit and self.llm_backend == "embedded":
+            from llm_embedded_deepseek import run_embedded_llm_post_edit_threaded
+
+            self._stage("LLM", "встроенная DeepSeek / Hugging Face")
+            self._log(
+                f"LLM пост-редактор (встроенная DeepSeek / Hugging Face), "
+                f"таймаут≤{self.llm_post_edit_timeout_seconds:.0f}s..."
+            )
+            t_llm = time.perf_counter()
+            nf, nr, llm_note = run_embedded_llm_post_edit_threaded(
+                text_work,
+                role_text_work,
+                model_id=(self.llm_embedded_model_id or "").strip() or None,
+                wall_timeout=float(self.llm_post_edit_timeout_seconds),
+                log=None,
+            )
+            llm_elapsed = time.perf_counter() - t_llm
+            if nf and nr:
+                text_work = self._postprocess_ru_text(nf)
+                role_text_work = nr.strip()
+                llm_diag = f"ok:{llm_note}"
+                self._log(f"LLM пост-редактор готов за {llm_elapsed:.2f}s ({llm_diag})")
+            else:
+                llm_diag = f"fallback:{llm_note}"
+                self._log(f"LLM пост-редактор не применён ({llm_diag}), {llm_elapsed:.2f}s")
+        elif llm_cfg is not None:
+            from llm_post_edit import run_llm_post_edit_threaded
+
+            self._stage("LLM", f"HTTP API {llm_cfg.base_url}, модель={llm_cfg.model}")
+            self._log(
+                f"LLM пост-редактор (HTTP): {llm_cfg.base_url}, модель={llm_cfg.model}, "
+                f"таймаут≤{self.llm_post_edit_timeout_seconds:.0f}s..."
+            )
+            t_llm = time.perf_counter()
+            nf, nr, llm_note = run_llm_post_edit_threaded(
+                text_work,
+                role_text_work,
+                llm_cfg,
+                wall_timeout=float(self.llm_post_edit_timeout_seconds),
+            )
+            llm_elapsed = time.perf_counter() - t_llm
+            if nf and nr:
+                text_work = self._postprocess_ru_text(nf)
+                role_text_work = nr.strip()
+                llm_diag = f"ok:{llm_note}"
+                self._log(f"LLM пост-редактор готов за {llm_elapsed:.2f}s ({llm_diag})")
+            else:
+                llm_diag = f"fallback:{llm_note}"
+                self._log(f"LLM пост-редактор не применён ({llm_diag}), {llm_elapsed:.2f}s")
+        elif self.enable_llm_post_edit and self.llm_backend == "remote":
+            llm_diag = "remote_missing_url_or_model"
+            self._stage("LLM", "remote: нет URL/модели — задайте LLM_POST_EDIT_* в .env")
+        elif self.enable_llm_post_edit:
+            self._stage(
+                "LLM-постредактор",
+                f"включён, но сценарий не сработал (backend={self.llm_backend!r})",
+            )
+
+        skip_local_post = nf is not None and nr is not None
+        post_elapsed = 0.0
+        post_status = "off"
+        post_reason = ""
+        role_refine_applied = "no"
+        refined_roles = role_labels
+        post_pieces: list[tuple[float, float, str]] | None = None
+
+        if skip_local_post:
+            post_status = "skipped_after_llm"
+            post_reason = llm_diag
+            self._stage("локальный пост", "пропуск — текст и роли уже обработаны LLM")
+        elif self.enable_post_edit:
+            self._stage("локальный пост", "пунктуация и уточнение ролей (локальная модель)")
+            self._log("Запускаю локальный пост-редактор текста/ролей...")
+            post_text, post_status, refined_roles, post_reason, post_pieces = self._post_edit_ru_dialogue(
+                raw_text=text_work,
+                pieces=role_pieces,
+                roles=role_labels,
+                role_confidence=role_confidence,
+                elapsed_before_post_edit=(aai_elapsed + (time.perf_counter() - total_started)),
+            )
+            text_work = post_text
+            post_elapsed = time.perf_counter() - (total_started + aai_elapsed)
+            self._log(
+                f"Локальный пост-редактор: mode={post_status}, reason={post_reason or 'ok'}, "
+                f"time={post_elapsed:.2f}s"
+            )
+        else:
+            post_reason = "disabled"
+            self._stage("локальный пост", "выключен (enable_post_edit=false)")
+
+        pieces_for_roles = post_pieces if post_pieces is not None else role_pieces
+        if not skip_local_post and refined_roles and pieces_for_roles and len(refined_roles) == len(pieces_for_roles):
+            new_role_text = self._roles_to_transcript([p[2] for p in pieces_for_roles], refined_roles)
+            if new_role_text:
+                role_refine_applied = "yes" if new_role_text != role_text_work else "no"
+                role_text_work = new_role_text
+
+        role_text_work, _thanks_role_fix = fix_operator_thanks_mislabeled_as_applicant(role_text_work)
+        if _thanks_role_fix:
+            self._log(
+                "[роли] Формула «спасибо/благодарность за обращение» была под «Заявитель» — "
+                "перенесена на «Оператор» (ошибка распределения ролей)."
+            )
+
+        text = text_work
+        role_text = role_text_work
+
+        # Build diagnostics
+        aai_diag_parts = f"asr_backend=assemblyai; model=universal-2; aai_seconds={aai_elapsed:.2f}"
+        if applicant_name_hint:
+            aai_diag_parts += f"; entity_applicant={applicant_name_hint}"
+        if content_moderation:
+            flagged = content_moderation.get("summary", {})
+            if flagged:
+                aai_diag_parts += f"; content_moderation={flagged}"
+        role_diagnostics = (
+            f"{role_diagnostics}; {aai_diag_parts}; "
+            f"llm_post_edit={llm_diag}; llm_seconds={llm_elapsed:.2f}; "
+            f"post_edit={post_status}; role_refine_applied={role_refine_applied}; "
+            f"fallback_reason={post_reason or 'n/a'}; post_edit_seconds={post_elapsed:.2f}"
+        )
+
+        self._log("Текст собран.")
+        self._log("Сформирована расшифровка по ролям.")
+        self._stage("тональность", "анализ тона по исходному аудио (librosa)")
+        tone_summary = analyze_tone(audio_path)
+        self._stage("тональность", f"результат: {tone_summary}")
+        self._log(f"Оценка тона: {tone_summary}")
+        self._stage(
+            "готово",
+            f"итог: язык=ru, символов текста={len(text)}, ASR=assemblyai/universal-2",
+        )
+        return TranscriptionResult(
+            text=text,
+            language="ru",
+            role_text=role_text,
+            tone_summary=tone_summary,
+            role_attribution=role_attribution,
+            role_confidence=role_confidence,
+            role_diagnostics=role_diagnostics,
+            asr_profile="assemblyai",
+            asr_model="assemblyai/universal-2",
+            asr_backend="assemblyai",
+            assemblyai_entities=entities,
+            assemblyai_content_moderation=content_moderation,
+        )
+
+    def _transcribe_nexara(
+        self,
+        audio_path: str,
+        *,
+        original_basename: str | None = None,
+    ) -> TranscriptionResult:
+        """Транскрибация через Nexara API (диаризация + распознавание)."""
+        from app_config import load_app_config
+        from nexara_backend import (
+            NexaraConfig,
+            map_nexara_to_voice_items,
+            transcribe as nexara_transcribe,
+        )
+
+        cfg = load_app_config()
+        api_key = cfg.nexara.api_key
+        if not api_key:
+            raise RuntimeError(
+                "Nexara backend выбран, но NEXARA_API_KEY не задан. "
+                "Укажите ключ в .env или в Админ-панели."
+            )
+
+        timeout = cfg.nexara.timeout_seconds
+        path = str(audio_path)
+        self._log(f"Nexara backend: файл «{Path(path).name}»")
+
+        # Parse wait skip from filename
+        skip_sec = 0.0
+        name_for_skip = (original_basename or Path(path).name).strip()
+        name_for_skip = Path(name_for_skip).name
+        parsed = parse_call_filename_wait_skip(name_for_skip)
+        if parsed is not None:
+            tot_wait, wait_token = parsed
+            disable_fn = os.environ.get("CALLQA_DISABLE_FILENAME_SKIP", "").strip().lower() in (
+                "1", "true", "yes",
+            )
+            if disable_fn:
+                self._log("[asr] Пропуск начала по хвосту имени отключён (CALLQA_DISABLE_FILENAME_SKIP).")
+            else:
+                skip_sec = tot_wait
+                mm = int(skip_sec // 60)
+                ss = int(skip_sec % 60)
+                self._log(
+                    f"Пропуск ожидания по имени файла: «{wait_token}» → {skip_sec:.0f} с "
+                    f"({mm:02d}:{ss:02d} от начала записи)"
+                )
+
+        nexara_config = NexaraConfig(
+            api_key=api_key,
+            language="ru",
+            timeout_seconds=timeout,
+            num_speakers=2,
+            diarization_setting="telephonic",
+            diarization_enabled=False,  # local ECAPA-TDNN + Resemblyzer diarization
+        )
+
+        self._stage("Nexara", "отправка аудио и ожидание результата...")
+        nexara_started = time.perf_counter()
+
+        response = nexara_transcribe(api_key, path, nexara_config, log=self._log)
+
+        nexara_elapsed = time.perf_counter() - nexara_started
+        self._stage("Nexara", f"транскрибация завершена за {nexara_elapsed:.1f} с")
+
+        # Map segments to voice items
+        voice_items = map_nexara_to_voice_items(response)
+        if not voice_items:
+            flat_text = response.get("text", "").strip()
+            self._log("[nexara] segments пусты — использую плоский текст без диаризации")
+            text = self._postprocess_ru_text(flat_text)
+            return TranscriptionResult(
+                text=text,
+                language="ru",
+                role_text="",
+                role_attribution="n/a",
+                role_confidence="n/a",
+                role_diagnostics="role_mode=nexara_no_segments",
+                asr_profile="nexara",
+                asr_model="nexara/nexara-ru",
+                asr_backend="nexara",
+            )
+
+        # Apply skip offset
+        if skip_sec > 0:
+            voice_items = [
+                (s - skip_sec, e - skip_sec, t, spk)
+                for s, e, t, spk in voice_items
+                if e > skip_sec
+            ]
+            voice_items = [
+                (max(0, s), e, t, spk) for s, e, t, spk in voice_items
+            ]
+
+        # Build flat text
+        text = " ".join(t for _, _, t, _ in voice_items).strip()
+        text = self._postprocess_ru_text(text)
+
+        self._stage("текст", f"символов ≈{len(text)}, фрагментов={len(voice_items)}")
+
+        # Role assignment via local ECAPA-TDNN + Resemblyzer diarization
+        total_started = time.perf_counter()
+        self._stage(
+            "роли",
+            f"Nexara transcription + local diarization: {len(voice_items)} фрагментов",
+        )
+
+        # Run local heavy diarization on the original audio file
+        diarization_turns: list[tuple[float, float, str]] = []
+        diarization_reason = "fallback text"
+        diarization_diag: dict[str, object] = {}
+
+        if self.heavy_diarization:
+            self._stage("роли/heavy", "тяжёлая диаризация по голосу (ECAPA-TDNN + Resemblyzer)...")
+            try:
+                from speaker_diarization_heavy import run_heavy_diarization
+                from speaker_voice_roles import _remap_segments_by_speaker_spans
+
+                turns, heavy_reason, heavy_diag = run_heavy_diarization(
+                    audio_path=path,
+                    target_speakers=2,
+                    max_seconds=self.heavy_diarization_timeout_seconds,
+                )
+                if turns:
+                    # Map Nexara segments onto local speaker spans
+                    clustered = _remap_segments_by_speaker_spans(
+                        [(s, e, t) for s, e, t, _ in voice_items],
+                        turns,
+                        min_split_sec=0.85,
+                        min_split_share=0.22,
+                        min_words_to_split=6,
+                    )
+                    if clustered:
+                        diarization_turns = turns
+                        diarization_reason = heavy_reason
+                        diarization_diag = heavy_diag
+                        # Rebuild voice_items with correct speaker labels
+                        voice_items = [(s, e, t, cid) for s, e, t, cid in clustered]
+            except Exception as exc:
+                self._log(f"Local heavy diarization ошибка ({exc}), перехожу на light.")
+
+        # Fallback: light clustering if heavy didn't produce results
+        if not diarization_turns:
+            self._stage(
+                "роли/ECAPA",
+                f"кластеризация голоса (лёгкий режим), фрагментов={len(voice_items)}",
+            )
+            try:
+                from speaker_voice_roles import cluster_voice_segments
+
+                clustered, cluster_reason, cluster_diag = cluster_voice_segments(
+                    audio_path=path,
+                    segments=[(s, e, t) for s, e, t, _ in voice_items],
+                    target_speakers=2,
+                )
+                if clustered:
+                    voice_items = clustered
+                    diarization_reason = cluster_reason
+                    diarization_diag = cluster_diag
+            except Exception as exc:
+                self._log(f"Light clustering ошибка ({exc}), остаюсь на текстовых метках.")
+
+        # Build speaker-to-text mapping from voice_items
+        speaker_ids = [spk for _, _, _, spk in voice_items]
+        unique_speakers = list(dict.fromkeys(speaker_ids))
+
+        speaker_texts: dict[str, list[str]] = {}
+        for _, _, txt, spk in voice_items:
+            speaker_texts.setdefault(spk, []).append(txt)
+
+        operator_speaker = self._pick_operator_cluster_from_speakers(speaker_texts)
+        if not operator_speaker and unique_speakers:
+            operator_speaker = unique_speakers[0]
+
+        role_map = {
+            spk: ("Оператор" if spk == operator_speaker else "Заявитель")
+            for spk in unique_speakers
+        }
+
+        role_labels = [role_map.get(spk, "Неизвестно") for spk in speaker_ids]
+        role_pieces = [(s, e, t) for s, e, t, _ in voice_items]
+
+        role_text_parts = []
+        for _, _, txt, spk in voice_items:
+            role = role_map.get(spk, "Неизвестно")
+            role_text_parts.append(f"{role}: {txt}")
+        role_text = "\n".join(role_text_parts)
+
+        role_attribution = f"Local diarization ({'heavy' if self.heavy_diarization and diarization_turns else 'light'})"
+        role_confidence = "medium"
+        _diag_quality = diarization_diag.get("cluster_quality", 0.0)
+        _diag_mode = diarization_diag.get("split_mode", "native")
+        role_diagnostics = (
+            f"role_mode=nexara_local_diarization; speakers={unique_speakers}; "
+            f"operator_speaker={operator_speaker or 'unknown'}; "
+            f"asr_seconds={nexara_elapsed:.2f}; "
+            f"split_mode={_diag_mode}; quality={_diag_quality:.3f}; "
+            f"reason={diarization_reason}"
+        )
+        joint_elapsed = time.perf_counter() - total_started
+        self._stage(
+            "роли",
+            f"блок завершён за {joint_elapsed:.2f} с — {role_attribution}; уверенность={role_confidence}",
+        )
+
+        text_work = text
+        role_text_work = role_text
+
+        # LLM post-edit
+        llm_elapsed = 0.0
+        llm_diag = "disabled"
+        nf: str | None = None
+        nr: str | None = None
+        llm_note = ""
+        llm_cfg = self._resolve_llm_post_edit_config()
+        if not self.enable_llm_post_edit:
+            self._stage("LLM-постредактор", "выключен в настройках")
+        if self.enable_llm_post_edit and self.llm_backend == "claude":
+            from app_config import load_app_config
+            from llm_cloud_eval import ClaudeCloudConfig, run_cloud_post_edit_threaded
+
+            app_cfg = load_app_config()
+            claude_cfg = app_cfg.claude_cloud.to_post_edit_config() if app_cfg.claude_cloud.api_key else None
+            if claude_cfg is None:
+                claude_cfg = ClaudeCloudConfig(
+                    api_key=self.llm_claude_api_key or "",
+                    base_url=self.llm_claude_base_url or "https://api.awstore.cloud",
+                    model=self.llm_claude_model or "claude-sonnet-4-6",
+                    timeout_seconds=self.llm_post_edit_timeout_seconds,
+                )
+            self._stage(
+                "LLM",
+                f"Claude (awstore), модель {claude_cfg.model}",
+            )
+            self._log(
+                f"LLM пост-редактор (Claude, {claude_cfg.base_url}, модель={claude_cfg.model}), "
+                f"таймаут≤{claude_cfg.timeout_seconds:.0f}s..."
+            )
+            t_llm = time.perf_counter()
+            nf, nr, llm_note = run_cloud_post_edit_threaded(
+                text_work,
+                role_text_work,
+                cfg=claude_cfg,
+                wall_timeout=claude_cfg.timeout_seconds,
+            )
+            llm_elapsed = time.perf_counter() - t_llm
+            if nf and nr:
+                text_work = self._postprocess_ru_text(nf)
+                role_text_work = nr.strip()
+                llm_diag = f"ok:{llm_note}"
+                self._log(f"LLM пост-редактор готов за {llm_elapsed:.2f}s ({llm_diag})")
+            else:
+                llm_diag = f"fallback:{llm_note}"
+                self._log(f"LLM пост-редактор не применён ({llm_diag}), {llm_elapsed:.2f}s")
+        elif self.enable_llm_post_edit and self.llm_backend == "yandex" and self.llm_yandex_api_key and self.llm_yandex_folder_id:
+            from llm_cloud_eval import YandexCloudConfig, run_yandex_post_edit_threaded
+
+            self._stage(
+                "LLM",
+                f"Yandex AI Studio, модель gpt://{self.llm_yandex_folder_id}/{self.llm_yandex_model}",
+            )
+            ycfg = YandexCloudConfig(
+                api_key=self.llm_yandex_api_key,
+                folder_id=self.llm_yandex_folder_id,
+                model=self.llm_yandex_model,
+                timeout_seconds=self.llm_post_edit_timeout_seconds,
+            )
+            self._log(
+                f"LLM пост-редактор (Yandex AI Studio, gpt://{self.llm_yandex_folder_id}/{self.llm_yandex_model}), "
+                f"таймаут≤{self.llm_post_edit_timeout_seconds:.0f}s..."
+            )
+            t_llm = time.perf_counter()
+            nf, nr, llm_note = run_yandex_post_edit_threaded(
+                text_work,
+                role_text_work,
+                cfg=ycfg,
+                wall_timeout=float(self.llm_post_edit_timeout_seconds),
+            )
+            llm_elapsed = time.perf_counter() - t_llm
+            if nf and nr:
+                text_work = self._postprocess_ru_text(nf)
+                role_text_work = nr.strip()
+                llm_diag = f"ok:{llm_note}"
+                self._log(f"LLM пост-редактор готов за {llm_elapsed:.2f}s ({llm_diag})")
+            else:
+                llm_diag = f"fallback:{llm_note}"
+                self._log(f"LLM пост-редактор не применён ({llm_diag}), {llm_elapsed:.2f}s")
+        elif self.enable_llm_post_edit and self.llm_backend == "embedded":
+            from llm_embedded_deepseek import run_embedded_llm_post_edit_threaded
+
+            self._stage("LLM", "встроенная DeepSeek / Hugging Face")
+            self._log(
+                f"LLM пост-редактор (встроенная DeepSeek / Hugging Face), "
+                f"таймаут≤{self.llm_post_edit_timeout_seconds:.0f}s..."
+            )
+            t_llm = time.perf_counter()
+            nf, nr, llm_note = run_embedded_llm_post_edit_threaded(
+                text_work,
+                role_text_work,
+                model_id=(self.llm_embedded_model_id or "").strip() or None,
+                wall_timeout=float(self.llm_post_edit_timeout_seconds),
+                log=None,
+            )
+            llm_elapsed = time.perf_counter() - t_llm
+            if nf and nr:
+                text_work = self._postprocess_ru_text(nf)
+                role_text_work = nr.strip()
+                llm_diag = f"ok:{llm_note}"
+                self._log(f"LLM пост-редактор готов за {llm_elapsed:.2f}s ({llm_diag})")
+            else:
+                llm_diag = f"fallback:{llm_note}"
+                self._log(f"LLM пост-редактор не применён ({llm_diag}), {llm_elapsed:.2f}s")
+        elif llm_cfg is not None:
+            from llm_post_edit import run_llm_post_edit_threaded
+
+            self._stage("LLM", f"HTTP API {llm_cfg.base_url}, модель={llm_cfg.model}")
+            self._log(
+                f"LLM пост-редактор (HTTP): {llm_cfg.base_url}, модель={llm_cfg.model}, "
+                f"таймаут≤{self.llm_post_edit_timeout_seconds:.0f}s..."
+            )
+            t_llm = time.perf_counter()
+            nf, nr, llm_note = run_llm_post_edit_threaded(
+                text_work,
+                role_text_work,
+                llm_cfg,
+                wall_timeout=float(self.llm_post_edit_timeout_seconds),
+            )
+            llm_elapsed = time.perf_counter() - t_llm
+            if nf and nr:
+                text_work = self._postprocess_ru_text(nf)
+                role_text_work = nr.strip()
+                llm_diag = f"ok:{llm_note}"
+                self._log(f"LLM пост-редактор готов за {llm_elapsed:.2f}s ({llm_diag})")
+            else:
+                llm_diag = f"fallback:{llm_note}"
+                self._log(f"LLM пост-редактор не применён ({llm_diag}), {llm_elapsed:.2f}s")
+        elif self.enable_llm_post_edit and self.llm_backend == "remote":
+            llm_diag = "remote_missing_url_or_model"
+            self._stage("LLM", "remote: нет URL/модели — задайте LLM_POST_EDIT_* в .env")
+        elif self.enable_llm_post_edit:
+            self._stage(
+                "LLM-постредактор",
+                f"включён, но сценарий не сработал (backend={self.llm_backend!r})",
+            )
+
+        skip_local_post = nf is not None and nr is not None
+        post_elapsed = 0.0
+        post_status = "off"
+        post_reason = ""
+        role_refine_applied = "no"
+        refined_roles = role_labels
+        post_pieces: list[tuple[float, float, str]] | None = None
+
+        if skip_local_post:
+            post_status = "skipped_after_llm"
+            post_reason = llm_diag
+            self._stage("локальный пост", "пропуск — текст и роли уже обработаны LLM")
+        elif self.enable_post_edit:
+            self._stage("локальный пост", "пунктуация и уточнение ролей (локальная модель)")
+            self._log("Запускаю локальный пост-редактор текста/ролей...")
+            post_text, post_status, refined_roles, post_reason, post_pieces = self._post_edit_ru_dialogue(
+                raw_text=text_work,
+                pieces=role_pieces,
+                roles=role_labels,
+                role_confidence=role_confidence,
+                elapsed_before_post_edit=(nexara_elapsed + (time.perf_counter() - total_started)),
+            )
+            text_work = post_text
+            post_elapsed = time.perf_counter() - (total_started + nexara_elapsed)
+            self._log(
+                f"Локальный пост-редактор: mode={post_status}, reason={post_reason or 'ok'}, "
+                f"time={post_elapsed:.2f}s"
+            )
+        else:
+            post_reason = "disabled"
+            self._stage("локальный пост", "выключен (enable_post_edit=false)")
+
+        pieces_for_roles = post_pieces if post_pieces is not None else role_pieces
+        if not skip_local_post and refined_roles and pieces_for_roles and len(refined_roles) == len(pieces_for_roles):
+            new_role_text = self._roles_to_transcript([p[2] for p in pieces_for_roles], refined_roles)
+            if new_role_text:
+                role_refine_applied = "yes" if new_role_text != role_text_work else "no"
+                role_text_work = new_role_text
+
+        role_text_work, _thanks_role_fix = fix_operator_thanks_mislabeled_as_applicant(role_text_work)
+        if _thanks_role_fix:
+            self._log(
+                "[роли] Формула «спасибо/благодарность за обращение» была под «Заявитель» — "
+                "перенесена на «Оператор» (ошибка распределения ролей)."
+            )
+
+        text = text_work
+        role_text = role_text_work
+
+        # Build diagnostics
+        nexara_diag_parts = f"asr_backend=nexara; model=nexara-ru; nexara_seconds={nexara_elapsed:.2f}"
+        role_diagnostics = (
+            f"{role_diagnostics}; {nexara_diag_parts}; "
+            f"llm_post_edit={llm_diag}; llm_seconds={llm_elapsed:.2f}; "
+            f"post_edit={post_status}; role_refine_applied={role_refine_applied}; "
+            f"fallback_reason={post_reason or 'n/a'}; post_edit_seconds={post_elapsed:.2f}"
+        )
+
+        self._log("Текст собран.")
+        self._log("Сформирована расшифровка по ролям.")
+        self._stage("тональность", "анализ тона по исходному аудио (librosa)")
+        tone_summary = analyze_tone(audio_path)
+        self._stage("тональность", f"результат: {tone_summary}")
+        self._log(f"Оценка тона: {tone_summary}")
+        self._stage(
+            "готово",
+            f"итог: язык=ru, символов текста={len(text)}, ASR=nexara/nexara-ru",
+        )
+        return TranscriptionResult(
+            text=text,
+            language="ru",
+            role_text=role_text,
+            tone_summary=tone_summary,
+            role_attribution=role_attribution,
+            role_confidence=role_confidence,
+            role_diagnostics=role_diagnostics,
+            asr_profile="nexara",
+            asr_model="nexara/nexara-ru",
+            asr_backend="nexara",
+        )
+
     def transcribe(
         self,
         audio_path: str | Path,
         *,
         original_basename: str | None = None,
     ) -> TranscriptionResult:
-        self._ensure_model()
         path = str(audio_path)
-        self._stage("начало", f"файл «{Path(path).name}»")
+        p = Path(path)
+        if not p.exists():
+            raise FileNotFoundError(f"Аудиофайл не найден: {path}")
+        if p.is_dir():
+            raise IsADirectoryError(f"Это директория, а не файл: {path}")
+        # Validate file size before loading (skip for cloud backends)
+        if self.asr_backend == "whisper":
+            try:
+                size_mb = p.stat().st_size / 1024 / 1024
+                max_mb = float(os.environ.get("CALLQA_MAX_AUDIO_MB", "512"))
+                if size_mb > max_mb:
+                    self._log(
+                        f"ВНИМАНИЕ: файл {p.name} = {size_mb:.1f} МБ (лимит {max_mb:.0f} МБ). "
+                        f"Это может потребовать много памяти. Задайте CALLQA_MAX_AUDIO_MB для лимита."
+                    )
+            except OSError:
+                pass
+        if self.asr_backend == "assemblyai":
+            return self._transcribe_assemblyai(path, original_basename=original_basename)
+        if self.asr_backend == "nexara":
+            return self._transcribe_nexara(path, original_basename=original_basename)
+        self._ensure_model()
+        self._stage("начало", f"файл «{p.name}»")
         self._log(f"Начинаю обработку файла: {path}")
         info_language: str | None = None
         # VAD: чувствительнее к тихому началу звонка; большой speech_pad — не отрезать первые слова до порога Silero.

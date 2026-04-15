@@ -45,6 +45,27 @@ def render_header() -> None:
     )
 
 
+def render_quick_stats(evaluation: QualityEvaluation) -> None:
+    """Renders compact score pills in a row for quick overview."""
+    color = _score_color(evaluation.total_score)
+    label = _score_label(evaluation.total_score)
+    st.markdown(
+        f"""
+<div style="display:flex; gap:8px; margin-bottom:16px; flex-wrap:wrap;">
+  <div style="background:{color}; color:#fff; padding:4px 14px; border-radius:99px; font-size:14px; font-weight:700;">
+    {evaluation.total_score}/10 · {label}
+  </div>
+  <div style="background:#f1f5f9; color:#475569; padding:4px 14px; border-radius:99px; font-size:13px; font-weight:500;">
+    Оператор: {evaluation.operator_name or '—'}
+  </div>
+  <div style="background:#f1f5f9; color:#475569; padding:4px 14px; border-radius:99px; font-size:13px; font-weight:500;">
+    Заявитель: {evaluation.applicant_name or '—'}
+  </div>
+</div>""",
+        unsafe_allow_html=True,
+    )
+
+
 def render_score_card(col, title: str, score: int, icon: str) -> None:
     color = _score_color(score)
     label = _score_label(score)
